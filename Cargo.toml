@@ -24,6 +24,11 @@ name = "mixed_read_write"
 harness = false
 path = "tests/bench/mixed_read_write.rs"
 
+[[bench]]
+name = "compaction_amplification"
+harness = false
+path = "tests/bench/compaction_amplification.rs"
+
 [dependencies]
 bincode = "1.3"
 bytes = "1.7"
