@@ -29,6 +29,11 @@ name = "compaction_amplification"
 harness = false
 path = "tests/bench/compaction_amplification.rs"
 
+[[bench]]
+name = "wal_recovery"
+harness = false
+path = "tests/bench/wal_recovery.rs"
+
 [dependencies]
 bincode = "1.3"
 bytes = "1.7"
