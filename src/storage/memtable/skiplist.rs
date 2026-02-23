@@ -87,6 +87,9 @@ impl SkipList {
 
         for (level, update) in updates.iter().take(node_level).enumerate() {
             let prev = *update;
+            if inner.nodes.get(prev).and_then(|entry| entry.next.get(level)).is_none() {
+                return None;
+            }
             node.next[level] = inner.nodes[prev].next_at(level);
         }
 
@@ -94,11 +97,11 @@ impl SkipList {
 
         for (level, update) in updates.iter().take(node_level).enumerate() {
             let prev = *update;
-            let next_ptr = inner
-                .nodes
-                .get_mut(prev)
-                .and_then(|entry| entry.next.get_mut(level))
-                .expect("skiplist predecessor must have pointer for current level");
+            let Some(next_ptr) =
+                inner.nodes.get_mut(prev).and_then(|entry| entry.next.get_mut(level))
+            else {
+                return None;
+            };
             *next_ptr = Some(new_index);
         }
 
@@ -216,8 +219,8 @@ fn compare_node_key(inner: &SkipListInner, node_index: usize, key: &[u8]) -> Ord
 fn initial_seed() -> u64 {
     let epoch_nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("system time should be after epoch")
-        .as_nanos() as u64;
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0);
     epoch_nanos ^ ((std::process::id() as u64) << 16) | 1
 }
 

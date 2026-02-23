@@ -56,7 +56,14 @@ pub struct DataBlockBuilder {
 
 impl Default for DataBlockBuilder {
     fn default() -> Self {
-        Self::new(DEFAULT_RESTART_INTERVAL).expect("default restart interval is always valid")
+        Self {
+            restart_interval: DEFAULT_RESTART_INTERVAL,
+            buffer: Vec::new(),
+            restarts: vec![0],
+            last_key: Vec::new(),
+            entries_since_restart: 0,
+            entry_count: 0,
+        }
     }
 }
 

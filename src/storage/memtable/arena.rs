@@ -40,12 +40,12 @@ impl Arena {
 
     pub fn allocate(&mut self, bytes: &[u8]) -> ArenaSlice {
         self.ensure_capacity(bytes.len());
+        if self.blocks.is_empty() {
+            self.allocate_block(bytes.len());
+        }
 
         let block_index = self.blocks.len() - 1;
-        let block = self
-            .blocks
-            .last_mut()
-            .expect("arena must contain at least one block after ensure_capacity");
+        let block = &mut self.blocks[block_index];
 
         let offset = block.len();
         block.extend_from_slice(bytes);
@@ -78,10 +78,9 @@ impl Arena {
             return;
         }
 
-        let remaining = {
-            let block = self.blocks.last().expect("blocks cannot be empty due to early return");
-            block.capacity() - block.len()
-        };
+        let last_index = self.blocks.len() - 1;
+        let block = &self.blocks[last_index];
+        let remaining = block.capacity() - block.len();
 
         if remaining < len {
             self.allocate_block(len);

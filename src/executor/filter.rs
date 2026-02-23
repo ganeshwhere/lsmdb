@@ -1,6 +1,6 @@
 use crate::sql::ast::{BinaryOp, Expr, UnaryOp};
 
-use super::{ExecutionError, Row, RowSet, ScalarValue, literal_to_scalar, scalar_type_name};
+use super::{literal_to_scalar, scalar_type_name, ExecutionError, Row, RowSet, ScalarValue};
 
 pub(crate) fn apply_filter(input: RowSet, predicate: &Expr) -> Result<RowSet, ExecutionError> {
     let RowSet { columns, rows, table_name } = input;
@@ -69,7 +69,14 @@ pub(crate) fn evaluate_expr(
                 }
             }
 
-            if let Some(value) = row.get(parts.last().expect("parts is not empty")) {
+            let Some(last_part) = parts.last() else {
+                return Err(ExecutionError::ColumnNotFound {
+                    table: table_name.unwrap_or("<row>").to_string(),
+                    column: "<empty>".to_string(),
+                });
+            };
+
+            if let Some(value) = row.get(last_part) {
                 return Ok(value.clone());
             }
 

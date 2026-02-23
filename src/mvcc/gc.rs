@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use thiserror::Error;
+
 use super::transaction::{MvccStore, PruneStats};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,8 +41,14 @@ pub struct GcWorker {
     last_removed_versions: Arc<AtomicU64>,
 }
 
+#[derive(Debug, Error)]
+pub enum GcWorkerError {
+    #[error("failed to start MVCC GC worker thread: {0}")]
+    Spawn(std::io::Error),
+}
+
 impl GcWorker {
-    pub fn start(store: MvccStore, config: GcConfig) -> Self {
+    pub fn start(store: MvccStore, config: GcConfig) -> Result<Self, GcWorkerError> {
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
         let last_removed_versions = Arc::new(AtomicU64::new(0));
         let last_removed_versions_worker = Arc::clone(&last_removed_versions);
@@ -58,9 +66,9 @@ impl GcWorker {
                     }
                 }
             })
-            .expect("failed to start MVCC GC worker thread");
+            .map_err(GcWorkerError::Spawn)?;
 
-        Self { shutdown_tx, handle: Some(handle), last_removed_versions }
+        Ok(Self { shutdown_tx, handle: Some(handle), last_removed_versions })
     }
 
     pub fn last_removed_versions(&self) -> u64 {
@@ -145,7 +153,8 @@ mod tests {
         }
 
         let worker =
-            GcWorker::start(store.clone(), GcConfig { interval: Duration::from_millis(20) });
+            GcWorker::start(store.clone(), GcConfig { interval: Duration::from_millis(20) })
+                .expect("start worker");
 
         thread::sleep(Duration::from_millis(80));
 
