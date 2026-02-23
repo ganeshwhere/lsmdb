@@ -206,6 +206,14 @@ impl MemTableManager {
         &self.immutables
     }
 
+    pub fn immutable_count(&self) -> usize {
+        self.immutables.len()
+    }
+
+    pub fn immutable_tables(&self) -> Vec<Arc<MemTable>> {
+        self.immutables.iter().cloned().collect()
+    }
+
     pub fn put(&mut self, user_key: &[u8], sequence: u64, value: &[u8]) -> bool {
         self.mutable.put(user_key, sequence, value);
         self.promote_if_needed()
@@ -238,6 +246,17 @@ impl MemTableManager {
 
     pub fn take_immutables(&mut self) -> Vec<Arc<MemTable>> {
         std::mem::take(&mut self.immutables)
+    }
+
+    pub fn remove_immutable(&mut self, target: &Arc<MemTable>) -> bool {
+        if let Some(index) =
+            self.immutables.iter().position(|candidate| Arc::ptr_eq(candidate, target))
+        {
+            self.immutables.remove(index);
+            return true;
+        }
+
+        false
     }
 }
 
@@ -308,5 +327,18 @@ mod tests {
         }
 
         assert_eq!(table.len(), workers * per_worker);
+    }
+
+    #[test]
+    fn manager_remove_immutable_by_arc_identity() {
+        let mut manager = MemTableManager::new(1, 32);
+        manager.put(b"a", 1, b"1");
+        assert_eq!(manager.immutable_count(), 1);
+
+        let immutable =
+            manager.immutable_tables().into_iter().next().expect("an immutable table should exist");
+
+        assert!(manager.remove_immutable(&immutable));
+        assert_eq!(manager.immutable_count(), 0);
     }
 }
