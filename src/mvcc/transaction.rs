@@ -121,6 +121,35 @@ impl MvccStore {
         self.inner.data.read().versions.get(key).cloned().unwrap_or_default()
     }
 
+    pub fn scan_prefix_at(&self, prefix: &[u8], read_ts: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let data = self.inner.data.read();
+        let mut rows = Vec::new();
+
+        for (key, versions) in &data.versions {
+            if !key.starts_with(prefix) {
+                continue;
+            }
+
+            for version in versions.iter().rev() {
+                if version.commit_ts > read_ts {
+                    continue;
+                }
+
+                if let Some(value) = &version.value {
+                    rows.push((key.clone(), value.clone()));
+                }
+                break;
+            }
+        }
+
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    }
+
+    pub fn scan_prefix_latest(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.scan_prefix_at(prefix, self.current_timestamp())
+    }
+
     pub(crate) fn commit_writes(
         &self,
         read_ts: u64,
@@ -342,5 +371,33 @@ mod tests {
         commits.dedup();
 
         assert_eq!(commits.len(), 4);
+    }
+
+    #[test]
+    fn scan_prefix_is_snapshot_aware() {
+        let store = MvccStore::new();
+
+        let mut seed = store.begin_transaction();
+        seed.put(b"prefix/a", b"v1").expect("seed prefix/a");
+        seed.put(b"prefix/b", b"v1").expect("seed prefix/b");
+        seed.put(b"other/x", b"v1").expect("seed other/x");
+        seed.commit().expect("seed commit");
+
+        let snapshot = store.begin_transaction();
+        let snapshot_ts = snapshot.read_ts().expect("snapshot ts");
+
+        let mut writer = store.begin_transaction();
+        writer.delete(b"prefix/a").expect("delete prefix/a");
+        writer.put(b"prefix/b", b"v2").expect("update prefix/b");
+        writer.commit().expect("writer commit");
+
+        let historical = store.scan_prefix_at(b"prefix/", snapshot_ts);
+        assert_eq!(
+            historical,
+            vec![(b"prefix/a".to_vec(), b"v1".to_vec()), (b"prefix/b".to_vec(), b"v1".to_vec())]
+        );
+
+        let latest = store.scan_prefix_latest(b"prefix/");
+        assert_eq!(latest, vec![(b"prefix/b".to_vec(), b"v2".to_vec())]);
     }
 }
