@@ -1,0 +1,418 @@
+use std::io::{Cursor, Read};
+
+use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+use crate::executor::{ExecutionResult, QueryResult, ScalarValue};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RequestType {
+    Query = 1,
+    Begin = 2,
+    Commit = 3,
+    Rollback = 4,
+}
+
+impl TryFrom<u8> for RequestType {
+    type Error = ProtocolError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(RequestType::Query),
+            2 => Ok(RequestType::Begin),
+            3 => Ok(RequestType::Commit),
+            4 => Ok(RequestType::Rollback),
+            other => {
+                Err(ProtocolError::InvalidFrame(format!("unknown request type byte: {other}")))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestFrame {
+    pub request_type: RequestType,
+    pub sql: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResponseFrame {
+    Ok(ResponsePayload),
+    Err(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResponsePayload {
+    Query(QueryPayload),
+    AffectedRows(u64),
+    TransactionState(TransactionState),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryPayload {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Vec<u8>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TransactionState {
+    Begun = 1,
+    Committed = 2,
+    RolledBack = 3,
+}
+
+#[derive(Debug, Error)]
+pub enum ProtocolError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("invalid frame: {0}")]
+    InvalidFrame(String),
+    #[error("utf8 decode error: {0}")]
+    Utf8(#[from] std::string::FromUtf8Error),
+}
+
+pub async fn read_request<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<Option<RequestFrame>, ProtocolError> {
+    let Some(body) = read_frame(reader).await? else {
+        return Ok(None);
+    };
+    decode_request(&body).map(Some)
+}
+
+pub async fn write_request<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    request: &RequestFrame,
+) -> Result<(), ProtocolError> {
+    let body = encode_request(request)?;
+    write_frame(writer, &body).await
+}
+
+pub async fn read_response<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<Option<ResponseFrame>, ProtocolError> {
+    let Some(body) = read_frame(reader).await? else {
+        return Ok(None);
+    };
+    decode_response(&body).map(Some)
+}
+
+pub async fn write_response<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    response: &ResponseFrame,
+) -> Result<(), ProtocolError> {
+    let body = encode_response(response)?;
+    write_frame(writer, &body).await
+}
+
+pub fn payload_from_execution_result(result: &ExecutionResult) -> ResponsePayload {
+    match result {
+        ExecutionResult::Query(query) => ResponsePayload::Query(query_to_payload(query)),
+        ExecutionResult::AffectedRows(rows) => ResponsePayload::AffectedRows(*rows),
+        ExecutionResult::TransactionBegun => {
+            ResponsePayload::TransactionState(TransactionState::Begun)
+        }
+        ExecutionResult::TransactionCommitted => {
+            ResponsePayload::TransactionState(TransactionState::Committed)
+        }
+        ExecutionResult::TransactionRolledBack => {
+            ResponsePayload::TransactionState(TransactionState::RolledBack)
+        }
+    }
+}
+
+fn query_to_payload(query: &QueryResult) -> QueryPayload {
+    let rows = query
+        .rows
+        .iter()
+        .map(|row| row.iter().map(scalar_to_wire_bytes).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    QueryPayload { columns: query.columns.clone(), rows }
+}
+
+fn scalar_to_wire_bytes(value: &ScalarValue) -> Vec<u8> {
+    match value {
+        ScalarValue::Integer(value) => value.to_string().into_bytes(),
+        ScalarValue::BigInt(value) => value.to_string().into_bytes(),
+        ScalarValue::Float(value) => value.to_string().into_bytes(),
+        ScalarValue::Text(value) => value.clone().into_bytes(),
+        ScalarValue::Boolean(value) => {
+            if *value {
+                b"true".to_vec()
+            } else {
+                b"false".to_vec()
+            }
+        }
+        ScalarValue::Blob(bytes) => bytes_to_hex(bytes).into_bytes(),
+        ScalarValue::Timestamp(value) => value.to_string().into_bytes(),
+        ScalarValue::Null => b"NULL".to_vec(),
+    }
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(hex_char(byte >> 4));
+        out.push(hex_char(byte & 0x0F));
+    }
+    out
+}
+
+fn hex_char(value: u8) -> char {
+    match value {
+        0..=9 => (b'0' + value) as char,
+        10..=15 => (b'a' + (value - 10)) as char,
+        _ => unreachable!(),
+    }
+}
+
+async fn read_frame<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<Option<Vec<u8>>, ProtocolError> {
+    let mut len_buf = [0_u8; 4];
+    match reader.read_exact(&mut len_buf).await {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(err) => return Err(ProtocolError::Io(err)),
+    }
+
+    let length = u32::from_be_bytes(len_buf) as usize;
+    if length == 0 {
+        return Err(ProtocolError::InvalidFrame(
+            "frame length must be greater than zero".to_string(),
+        ));
+    }
+
+    let mut body = vec![0_u8; length];
+    reader.read_exact(&mut body).await?;
+    Ok(Some(body))
+}
+
+async fn write_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    body: &[u8],
+) -> Result<(), ProtocolError> {
+    let len = u32::try_from(body.len())
+        .map_err(|_| ProtocolError::InvalidFrame("frame is too large".to_string()))?;
+    writer.write_all(&len.to_be_bytes()).await?;
+    writer.write_all(body).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+fn encode_request(request: &RequestFrame) -> Result<Vec<u8>, ProtocolError> {
+    let mut body = Vec::new();
+    body.push(request.request_type as u8);
+    body.extend(request.sql.as_bytes());
+    Ok(body)
+}
+
+fn decode_request(body: &[u8]) -> Result<RequestFrame, ProtocolError> {
+    let (&request_type, sql_bytes) = body
+        .split_first()
+        .ok_or_else(|| ProtocolError::InvalidFrame("request frame is empty".to_string()))?;
+    let request_type = RequestType::try_from(request_type)?;
+    let sql = String::from_utf8(sql_bytes.to_vec())?;
+
+    Ok(RequestFrame { request_type, sql })
+}
+
+fn encode_response(response: &ResponseFrame) -> Result<Vec<u8>, ProtocolError> {
+    let mut body = Vec::new();
+    match response {
+        ResponseFrame::Ok(payload) => {
+            body.push(0_u8);
+            encode_payload(payload, &mut body)?;
+        }
+        ResponseFrame::Err(message) => {
+            body.push(1_u8);
+            write_len_prefixed_bytes(&mut body, message.as_bytes())?;
+        }
+    }
+    Ok(body)
+}
+
+fn decode_response(body: &[u8]) -> Result<ResponseFrame, ProtocolError> {
+    let (&status, payload) = body
+        .split_first()
+        .ok_or_else(|| ProtocolError::InvalidFrame("response frame is empty".to_string()))?;
+
+    match status {
+        0 => {
+            let mut cursor = Cursor::new(payload);
+            let decoded_payload = decode_payload(&mut cursor)?;
+            if (cursor.position() as usize) != payload.len() {
+                return Err(ProtocolError::InvalidFrame(
+                    "response payload has trailing bytes".to_string(),
+                ));
+            }
+            Ok(ResponseFrame::Ok(decoded_payload))
+        }
+        1 => {
+            let mut cursor = Cursor::new(payload);
+            let message = read_len_prefixed_string(&mut cursor)?;
+            if (cursor.position() as usize) != payload.len() {
+                return Err(ProtocolError::InvalidFrame(
+                    "error payload has trailing bytes".to_string(),
+                ));
+            }
+            Ok(ResponseFrame::Err(message))
+        }
+        other => Err(ProtocolError::InvalidFrame(format!("unknown response status byte: {other}"))),
+    }
+}
+
+fn encode_payload(payload: &ResponsePayload, out: &mut Vec<u8>) -> Result<(), ProtocolError> {
+    match payload {
+        ResponsePayload::Query(query) => {
+            out.push(1_u8);
+            write_u16(out, query.columns.len())?;
+            for column in &query.columns {
+                write_len_prefixed_bytes(out, column.as_bytes())?;
+            }
+            write_u32(out, query.rows.len())?;
+            for row in &query.rows {
+                write_u16(out, row.len())?;
+                for value in row {
+                    write_len_prefixed_bytes(out, value)?;
+                }
+            }
+        }
+        ResponsePayload::AffectedRows(affected) => {
+            out.push(2_u8);
+            out.extend(affected.to_be_bytes());
+        }
+        ResponsePayload::TransactionState(state) => {
+            out.push(3_u8);
+            out.push(*state as u8);
+        }
+    }
+    Ok(())
+}
+
+fn decode_payload(cursor: &mut Cursor<&[u8]>) -> Result<ResponsePayload, ProtocolError> {
+    let payload_type = read_u8(cursor)?;
+    match payload_type {
+        1 => {
+            let col_count = read_u16(cursor)? as usize;
+            let mut columns = Vec::with_capacity(col_count);
+            for _ in 0..col_count {
+                columns.push(read_len_prefixed_string(cursor)?);
+            }
+
+            let row_count = read_u32(cursor)? as usize;
+            let mut rows = Vec::with_capacity(row_count);
+            for _ in 0..row_count {
+                let cell_count = read_u16(cursor)? as usize;
+                let mut row = Vec::with_capacity(cell_count);
+                for _ in 0..cell_count {
+                    row.push(read_len_prefixed_bytes(cursor)?);
+                }
+                rows.push(row);
+            }
+            Ok(ResponsePayload::Query(QueryPayload { columns, rows }))
+        }
+        2 => {
+            let mut raw = [0_u8; 8];
+            read_exact(cursor, &mut raw)?;
+            Ok(ResponsePayload::AffectedRows(u64::from_be_bytes(raw)))
+        }
+        3 => {
+            let state = match read_u8(cursor)? {
+                1 => TransactionState::Begun,
+                2 => TransactionState::Committed,
+                3 => TransactionState::RolledBack,
+                other => {
+                    return Err(ProtocolError::InvalidFrame(format!(
+                        "unknown transaction state byte: {other}"
+                    )));
+                }
+            };
+            Ok(ResponsePayload::TransactionState(state))
+        }
+        other => {
+            Err(ProtocolError::InvalidFrame(format!("unknown response payload type: {other}")))
+        }
+    }
+}
+
+fn write_len_prefixed_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), ProtocolError> {
+    write_u32(out, bytes.len())?;
+    out.extend(bytes);
+    Ok(())
+}
+
+fn write_u16(out: &mut Vec<u8>, value: usize) -> Result<(), ProtocolError> {
+    let value = u16::try_from(value)
+        .map_err(|_| ProtocolError::InvalidFrame("value exceeds u16 range".to_string()))?;
+    out.extend(value.to_be_bytes());
+    Ok(())
+}
+
+fn write_u32(out: &mut Vec<u8>, value: usize) -> Result<(), ProtocolError> {
+    let value = u32::try_from(value)
+        .map_err(|_| ProtocolError::InvalidFrame("value exceeds u32 range".to_string()))?;
+    out.extend(value.to_be_bytes());
+    Ok(())
+}
+
+fn read_u8(cursor: &mut Cursor<&[u8]>) -> Result<u8, ProtocolError> {
+    let mut raw = [0_u8; 1];
+    read_exact(cursor, &mut raw)?;
+    Ok(raw[0])
+}
+
+fn read_u16(cursor: &mut Cursor<&[u8]>) -> Result<u16, ProtocolError> {
+    let mut raw = [0_u8; 2];
+    read_exact(cursor, &mut raw)?;
+    Ok(u16::from_be_bytes(raw))
+}
+
+fn read_u32(cursor: &mut Cursor<&[u8]>) -> Result<u32, ProtocolError> {
+    let mut raw = [0_u8; 4];
+    read_exact(cursor, &mut raw)?;
+    Ok(u32::from_be_bytes(raw))
+}
+
+fn read_len_prefixed_string(cursor: &mut Cursor<&[u8]>) -> Result<String, ProtocolError> {
+    let bytes = read_len_prefixed_bytes(cursor)?;
+    String::from_utf8(bytes).map_err(ProtocolError::Utf8)
+}
+
+fn read_len_prefixed_bytes(cursor: &mut Cursor<&[u8]>) -> Result<Vec<u8>, ProtocolError> {
+    let len = read_u32(cursor)? as usize;
+    let mut bytes = vec![0_u8; len];
+    read_exact(cursor, &mut bytes)?;
+    Ok(bytes)
+}
+
+fn read_exact(cursor: &mut Cursor<&[u8]>, out: &mut [u8]) -> Result<(), ProtocolError> {
+    cursor.read_exact(out).map_err(|err| ProtocolError::InvalidFrame(err.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn request_round_trip() {
+        let request =
+            RequestFrame { request_type: RequestType::Query, sql: "SELECT 1".to_string() };
+
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        write_request(&mut client, &request).await.expect("write request");
+        let decoded = read_request(&mut server).await.expect("read request").expect("request");
+        assert_eq!(decoded, request);
+    }
+
+    #[tokio::test]
+    async fn response_round_trip() {
+        let response = ResponseFrame::Ok(ResponsePayload::AffectedRows(3));
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        write_response(&mut client, &response).await.expect("write response");
+        let decoded = read_response(&mut server).await.expect("read response").expect("response");
+        assert_eq!(decoded, response);
+    }
+}
