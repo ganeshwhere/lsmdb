@@ -1,4 +1,60 @@
+use lsmdb::mvcc::{MvccStore, TransactionError};
+
 #[test]
-fn mvcc_isolation_scaffold() {
-    assert!(true);
+fn snapshot_reader_sees_stable_view() {
+    let store = MvccStore::new();
+
+    let mut seed = store.begin_transaction();
+    seed.put(b"user:1", b"v1").expect("seed put");
+    seed.commit().expect("seed commit");
+
+    let snapshot_reader = store.begin_transaction();
+
+    let mut writer = store.begin_transaction();
+    writer.put(b"user:1", b"v2").expect("writer put");
+    writer.commit().expect("writer commit");
+
+    assert_eq!(snapshot_reader.get(b"user:1").expect("snapshot read"), Some(b"v1".to_vec()));
+
+    let latest_reader = store.begin_transaction();
+    assert_eq!(latest_reader.get(b"user:1").expect("latest read"), Some(b"v2".to_vec()));
+}
+
+#[test]
+fn write_write_conflict_aborts_second_committer() {
+    let store = MvccStore::new();
+
+    let mut tx_a = store.begin_transaction();
+    let mut tx_b = store.begin_transaction();
+
+    tx_a.put(b"counter", b"1").expect("tx_a write");
+    tx_b.put(b"counter", b"2").expect("tx_b write");
+
+    tx_a.commit().expect("tx_a commit");
+
+    let err = tx_b.commit().expect_err("tx_b must conflict");
+    assert!(matches!(err, TransactionError::WriteWriteConflict { .. }));
+}
+
+#[test]
+fn deletes_are_versioned_and_visible_after_commit() {
+    let store = MvccStore::new();
+
+    let mut writer = store.begin_transaction();
+    writer.put(b"k", b"value").expect("put k");
+    writer.commit().expect("commit put");
+
+    let reader_before_delete = store.begin_transaction();
+
+    let mut deleter = store.begin_transaction();
+    deleter.delete(b"k").expect("delete k");
+    deleter.commit().expect("commit delete");
+
+    assert_eq!(
+        reader_before_delete.get(b"k").expect("snapshot read before delete"),
+        Some(b"value".to_vec())
+    );
+
+    let reader_after_delete = store.begin_transaction();
+    assert_eq!(reader_after_delete.get(b"k").expect("read after delete"), None);
 }
