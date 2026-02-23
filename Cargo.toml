@@ -19,6 +19,11 @@ name = "read_latency"
 harness = false
 path = "tests/bench/read_latency.rs"
 
+[[bench]]
+name = "mixed_read_write"
+harness = false
+path = "tests/bench/mixed_read_write.rs"
+
 [dependencies]
 bincode = "1.3"
 bytes = "1.7"
