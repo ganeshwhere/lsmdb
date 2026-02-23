@@ -14,8 +14,8 @@ use crate::sql::parser::{ParseError, parse_sql};
 use crate::sql::validator::{ValidationError, validate_statement};
 
 use super::protocol::{
-    ProtocolError, RequestFrame, RequestType, ResponseFrame, payload_from_execution_result,
-    read_request, write_response,
+    ProtocolError, RequestFrame, RequestType, ResponseFrame, ResponsePayload,
+    payload_from_execution_result, read_request, write_response,
 };
 
 #[derive(Debug, Error)]
@@ -149,6 +149,7 @@ fn execute_request(
         RequestType::Begin => execute_sql(session, catalog, "BEGIN ISOLATION LEVEL SNAPSHOT"),
         RequestType::Commit => execute_sql(session, catalog, "COMMIT"),
         RequestType::Rollback => execute_sql(session, catalog, "ROLLBACK"),
+        RequestType::Explain => explain_sql(catalog, &request.sql),
     }
 }
 
@@ -171,4 +172,28 @@ fn execute_sql(
         RequestError::InvalidRequest("SQL payload produced no executable statement".to_string())
     })?;
     Ok(payload_from_execution_result(&result))
+}
+
+fn explain_sql(catalog: &Catalog, sql: &str) -> Result<ResponsePayload, RequestError> {
+    if sql.trim().is_empty() {
+        return Err(RequestError::InvalidRequest(
+            "explain request requires non-empty SQL payload".to_string(),
+        ));
+    }
+
+    let statements = parse_sql(sql)?;
+    if statements.is_empty() {
+        return Err(RequestError::InvalidRequest(
+            "SQL payload produced no executable statement".to_string(),
+        ));
+    }
+
+    let mut rendered = Vec::new();
+    for (index, statement) in statements.into_iter().enumerate() {
+        validate_statement(catalog, &statement)?;
+        let plan = plan_statement(catalog, &statement)?;
+        rendered.push(format!("Statement {}:\n{plan:#?}", index + 1));
+    }
+
+    Ok(ResponsePayload::ExplainPlan(rendered.join("\n\n")))
 }

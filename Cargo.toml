@@ -5,6 +5,10 @@ edition = "2024"
 description = "An LSM-tree based relational database in Rust"
 license = "MIT"
 
+[[bin]]
+name = "lsmdb-cli"
+path = "tools/lsmdb-cli/main.rs"
+
 [dependencies]
 bincode = "1.3"
 bytes = "1.7"

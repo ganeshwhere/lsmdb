@@ -12,6 +12,7 @@ pub enum RequestType {
     Begin = 2,
     Commit = 3,
     Rollback = 4,
+    Explain = 5,
 }
 
 impl TryFrom<u8> for RequestType {
@@ -23,6 +24,7 @@ impl TryFrom<u8> for RequestType {
             2 => Ok(RequestType::Begin),
             3 => Ok(RequestType::Commit),
             4 => Ok(RequestType::Rollback),
+            5 => Ok(RequestType::Explain),
             other => {
                 Err(ProtocolError::InvalidFrame(format!("unknown request type byte: {other}")))
             }
@@ -47,6 +49,7 @@ pub enum ResponsePayload {
     Query(QueryPayload),
     AffectedRows(u64),
     TransactionState(TransactionState),
+    ExplainPlan(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -288,6 +291,10 @@ fn encode_payload(payload: &ResponsePayload, out: &mut Vec<u8>) -> Result<(), Pr
             out.push(3_u8);
             out.push(*state as u8);
         }
+        ResponsePayload::ExplainPlan(plan) => {
+            out.push(4_u8);
+            write_len_prefixed_bytes(out, plan.as_bytes())?;
+        }
     }
     Ok(())
 }
@@ -331,6 +338,10 @@ fn decode_payload(cursor: &mut Cursor<&[u8]>) -> Result<ResponsePayload, Protoco
                 }
             };
             Ok(ResponsePayload::TransactionState(state))
+        }
+        4 => {
+            let plan = read_len_prefixed_string(cursor)?;
+            Ok(ResponsePayload::ExplainPlan(plan))
         }
         other => {
             Err(ProtocolError::InvalidFrame(format!("unknown response payload type: {other}")))
@@ -410,6 +421,16 @@ mod tests {
     #[tokio::test]
     async fn response_round_trip() {
         let response = ResponseFrame::Ok(ResponsePayload::AffectedRows(3));
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        write_response(&mut client, &response).await.expect("write response");
+        let decoded = read_response(&mut server).await.expect("read response").expect("response");
+        assert_eq!(decoded, response);
+    }
+
+    #[tokio::test]
+    async fn explain_payload_round_trip() {
+        let response =
+            ResponseFrame::Ok(ResponsePayload::ExplainPlan("PrimaryKeyScan(users)".to_string()));
         let (mut client, mut server) = tokio::io::duplex(1024);
         write_response(&mut client, &response).await.expect("write response");
         let decoded = read_response(&mut server).await.expect("read response").expect("response");

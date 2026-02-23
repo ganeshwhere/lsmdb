@@ -22,6 +22,13 @@ fn response_to_query(response: ResponseFrame) -> QueryPayload {
     }
 }
 
+fn response_to_explain(response: ResponseFrame) -> String {
+    match response {
+        ResponseFrame::Ok(ResponsePayload::ExplainPlan(plan)) => plan,
+        other => panic!("expected explain payload, got {other:?}"),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn server_executes_query_requests_end_to_end() {
     let store = Arc::new(MvccStore::new());
@@ -69,6 +76,52 @@ async fn server_executes_query_requests_end_to_end() {
     assert_eq!(query.rows.len(), 1);
     assert_eq!(from_utf8(&query.rows[0][0]).expect("utf8 cell"), "1");
     assert_eq!(from_utf8(&query.rows[0][1]).expect("utf8 cell"), "alice@x.com");
+
+    server.shutdown().await.expect("shutdown server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_returns_explain_plan_without_executing_statement() {
+    let store = Arc::new(MvccStore::new());
+    let catalog = Arc::new(Catalog::open((*store).clone()).expect("open catalog"));
+
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("parse socket addr");
+    let server = start_server(bind_addr, Arc::clone(&catalog), Arc::clone(&store))
+        .await
+        .expect("start server");
+    let server_addr = server.local_addr();
+
+    let mut client = TcpStream::connect(server_addr).await.expect("connect client");
+
+    let create_response = send_request(
+        &mut client,
+        RequestFrame {
+            request_type: RequestType::Query,
+            sql: "CREATE TABLE users (id BIGINT NOT NULL, email TEXT NOT NULL, PRIMARY KEY (id))"
+                .to_string(),
+        },
+    )
+    .await;
+    assert!(matches!(create_response, ResponseFrame::Ok(ResponsePayload::AffectedRows(0))));
+
+    let explain_response = send_request(
+        &mut client,
+        RequestFrame {
+            request_type: RequestType::Explain,
+            sql: "SELECT id FROM users WHERE id = 1".to_string(),
+        },
+    )
+    .await;
+    let explain = response_to_explain(explain_response);
+    assert!(explain.contains("PrimaryKeyScan"));
+
+    let select_response = send_request(
+        &mut client,
+        RequestFrame { request_type: RequestType::Query, sql: "SELECT id FROM users".to_string() },
+    )
+    .await;
+    let query = response_to_query(select_response);
+    assert!(query.rows.is_empty());
 
     server.shutdown().await.expect("shutdown server");
 }
