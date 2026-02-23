@@ -241,6 +241,33 @@ impl Transaction {
         Ok(self.store.read_at(key, read_ts))
     }
 
+    pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TransactionError> {
+        if self.closed {
+            return Err(TransactionError::Closed);
+        }
+
+        let read_ts = self.read_ts()?;
+        let mut visible =
+            self.store.scan_prefix_at(prefix, read_ts).into_iter().collect::<BTreeMap<_, _>>();
+
+        for (key, value) in &self.writes {
+            if !key.starts_with(prefix) {
+                continue;
+            }
+
+            match value {
+                Some(value) => {
+                    visible.insert(key.clone(), value.clone());
+                }
+                None => {
+                    visible.remove(key);
+                }
+            }
+        }
+
+        Ok(visible.into_iter().collect())
+    }
+
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), TransactionError> {
         if self.closed {
             return Err(TransactionError::Closed);
@@ -399,5 +426,26 @@ mod tests {
 
         let latest = store.scan_prefix_latest(b"prefix/");
         assert_eq!(latest, vec![(b"prefix/b".to_vec(), b"v2".to_vec())]);
+    }
+
+    #[test]
+    fn transaction_prefix_scan_includes_uncommitted_writes() {
+        let store = MvccStore::new();
+
+        let mut seed = store.begin_transaction();
+        seed.put(b"k/a", b"v1").expect("seed a");
+        seed.put(b"k/b", b"v1").expect("seed b");
+        seed.commit().expect("seed commit");
+
+        let mut tx = store.begin_transaction();
+        tx.put(b"k/c", b"v2").expect("write c");
+        tx.delete(b"k/a").expect("delete a");
+        tx.put(b"other/x", b"ignore").expect("write other");
+
+        let rows = tx.scan_prefix(b"k/").expect("prefix scan");
+        assert_eq!(
+            rows,
+            vec![(b"k/b".to_vec(), b"v1".to_vec()), (b"k/c".to_vec(), b"v2".to_vec())]
+        );
     }
 }
