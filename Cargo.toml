@@ -14,6 +14,11 @@ name = "write_throughput"
 harness = false
 path = "tests/bench/write_throughput.rs"
 
+[[bench]]
+name = "read_latency"
+harness = false
+path = "tests/bench/read_latency.rs"
+
 [dependencies]
 bincode = "1.3"
 bytes = "1.7"
@@ -27,4 +32,5 @@ tracing = "0.1"
 
 [dev-dependencies]
 criterion = "0.5"
+hdrhistogram = "7.5"
 proptest = "1.5"
