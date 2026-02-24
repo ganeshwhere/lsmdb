@@ -130,3 +130,60 @@ fn engine_exposes_metrics_for_wal_memtable_and_compaction() {
 
     fs::remove_dir_all(dir).expect("cleanup temp dir");
 }
+
+#[test]
+fn engine_shutdown_is_idempotent_and_flushes_mutable_memtable() {
+    let dir = temp_dir("shutdown-explicit");
+    let options = StorageEngineOptions {
+        memtable_size_bytes: 8 * 1024 * 1024,
+        ..StorageEngineOptions::default()
+    };
+
+    {
+        let engine =
+            StorageEngine::open_with_options(&dir, options.clone()).expect("open storage engine");
+        engine.put(b"alpha", b"1").expect("put alpha");
+        engine.put(b"beta", b"2").expect("put beta");
+        assert_eq!(engine.sstable_count(), 0);
+
+        engine.shutdown().expect("explicit shutdown");
+        engine.shutdown().expect("idempotent shutdown");
+
+        assert!(engine.sstable_count() >= 1);
+    }
+
+    {
+        let engine = StorageEngine::open_with_options(&dir, options).expect("reopen engine");
+        assert_eq!(engine.get(b"alpha").expect("read alpha"), Some(b"1".to_vec()));
+        assert_eq!(engine.get(b"beta").expect("read beta"), Some(b"2".to_vec()));
+        assert!(engine.sstable_count() >= 1);
+    }
+
+    fs::remove_dir_all(dir).expect("cleanup temp dir");
+}
+
+#[test]
+fn engine_drop_runs_graceful_shutdown_and_flushes_memtable() {
+    let dir = temp_dir("shutdown-drop");
+    let options = StorageEngineOptions {
+        memtable_size_bytes: 8 * 1024 * 1024,
+        ..StorageEngineOptions::default()
+    };
+
+    {
+        let engine =
+            StorageEngine::open_with_options(&dir, options.clone()).expect("open storage engine");
+        engine.put(b"gamma", b"3").expect("put gamma");
+        engine.put(b"delta", b"4").expect("put delta");
+        assert_eq!(engine.sstable_count(), 0);
+    }
+
+    {
+        let engine = StorageEngine::open_with_options(&dir, options).expect("reopen engine");
+        assert_eq!(engine.get(b"gamma").expect("read gamma"), Some(b"3".to_vec()));
+        assert_eq!(engine.get(b"delta").expect("read delta"), Some(b"4".to_vec()));
+        assert!(engine.sstable_count() >= 1);
+    }
+
+    fs::remove_dir_all(dir).expect("cleanup temp dir");
+}

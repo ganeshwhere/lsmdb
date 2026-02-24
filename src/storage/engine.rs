@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -212,6 +212,7 @@ pub struct StorageEngine {
     flush_tx: Sender<FlushRequest>,
     flush_rx: Mutex<Receiver<FlushResponse>>,
     flush_thread: Mutex<Option<JoinHandle<()>>>,
+    shutdown_complete: AtomicBool,
 }
 
 impl StorageEngine {
@@ -291,6 +292,7 @@ impl StorageEngine {
             flush_tx,
             flush_rx: Mutex::new(result_rx),
             flush_thread: Mutex::new(Some(flush_thread)),
+            shutdown_complete: AtomicBool::new(false),
         };
 
         {
@@ -485,6 +487,43 @@ impl StorageEngine {
         *self.metrics.compaction.lock() = metrics;
     }
 
+    pub fn shutdown(&self) -> Result<(), EngineError> {
+        if self
+            .shutdown_complete
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+
+        info!("graceful storage engine shutdown requested");
+
+        if let Err(err) = self.force_flush() {
+            self.shutdown_complete.store(false, Ordering::Release);
+            return Err(err);
+        }
+
+        {
+            let mut writer = self.wal_writer.lock();
+            if let Err(err) = writer.sync_data() {
+                self.shutdown_complete.store(false, Ordering::Release);
+                return Err(EngineError::WalWrite(err));
+            }
+        }
+
+        {
+            let mut manifest = self.manifest.lock();
+            if let Err(err) = manifest.sync() {
+                self.shutdown_complete.store(false, Ordering::Release);
+                return Err(EngineError::Manifest(err));
+            }
+        }
+
+        self.stop_flush_worker()?;
+        info!("graceful storage engine shutdown complete");
+        Ok(())
+    }
+
     fn append_wal(&self, operation: &WalOperation) -> Result<(), EngineError> {
         let payload = bincode::serialize(operation)
             .map_err(|err| EngineError::Serialization(err.to_string()))?;
@@ -611,14 +650,34 @@ impl StorageEngine {
 
         Ok(())
     }
+
+    fn stop_flush_worker(&self) -> Result<(), EngineError> {
+        let handle = {
+            let mut guard = self.flush_thread.lock();
+            if guard.is_none() {
+                return Ok(());
+            }
+            let _ = self.flush_tx.send(FlushRequest::Shutdown);
+            guard.take()
+        };
+
+        if let Some(handle) = handle {
+            handle.join().map_err(|_| {
+                EngineError::BackgroundFlush(
+                    "flush worker thread panicked during shutdown".to_string(),
+                )
+            })?;
+        }
+
+        Ok(())
+    }
 }
 
 impl Drop for StorageEngine {
     fn drop(&mut self) {
-        debug!("shutting down storage engine");
-        let _ = self.flush_tx.send(FlushRequest::Shutdown);
-        if let Some(handle) = self.flush_thread.lock().take() {
-            let _ = handle.join();
+        debug!("dropping storage engine");
+        if let Err(err) = self.shutdown() {
+            warn!(error = %err, "graceful shutdown failed during drop");
         }
     }
 }

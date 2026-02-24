@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use super::record::{
-    encode_physical, parse_segment_id, segment_file_name, RecordEncodeError, RecordType,
-    BLOCK_SIZE_BYTES, DEFAULT_SEGMENT_SIZE_BYTES, HEADER_LEN,
+    BLOCK_SIZE_BYTES, DEFAULT_SEGMENT_SIZE_BYTES, HEADER_LEN, RecordEncodeError, RecordType,
+    encode_physical, parse_segment_id, segment_file_name,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +110,10 @@ impl WalWriter {
 
     pub fn current_segment_path(&self) -> &Path {
         &self.segment_path
+    }
+
+    pub fn sync_data(&mut self) -> Result<(), WalWriteError> {
+        self.sync()
     }
 
     fn write_logical_record(&mut self, payload: &[u8]) -> Result<(), WalWriteError> {

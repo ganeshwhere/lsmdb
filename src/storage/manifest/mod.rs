@@ -76,6 +76,12 @@ impl Manifest {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    pub fn sync(&mut self) -> Result<(), ManifestError> {
+        self.writer.flush()?;
+        self.writer.get_ref().sync_data()?;
+        Ok(())
+    }
 }
 
 fn replay_manifest_file(path: &Path) -> Result<VersionSet, ManifestError> {
