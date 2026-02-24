@@ -1,0 +1,28 @@
+[storage]
+memtable_size_bytes = 67108864
+memtable_arena_block_size_bytes = 4096
+flush_poll_interval_ms = 10
+flush_timeout_ms = 5000
+
+[wal]
+segment_size_bytes = 67108864
+sync_mode = "on_commit"
+
+[sstable]
+data_block_size_bytes = 4096
+restart_interval = 16
+bloom_fpr = 0.01
+
+[compaction]
+strategy = "leveled"
+
+[compaction.leveled]
+level0_file_limit = 4
+level_size_base_bytes = 67108864
+level_size_multiplier = 10
+max_levels = 7
+
+[compaction.tiered]
+max_components_per_tier = 4
+min_tier_size_bytes = 1
+output_level = 0

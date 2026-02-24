@@ -1,4 +1,5 @@
 pub mod catalog;
+pub mod config;
 pub mod executor;
 pub mod mvcc;
 pub mod observability;
