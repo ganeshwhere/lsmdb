@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use lsmdb::storage::compaction::CompactionMetrics;
 use lsmdb::storage::engine::{StorageEngine, StorageEngineOptions};
 
 fn temp_dir(label: &str) -> PathBuf {
@@ -75,6 +76,56 @@ fn engine_recovers_from_manifest_and_wal_after_restart() {
         assert_eq!(engine.get(b"alpha").expect("read alpha"), Some(b"1".to_vec()));
         assert_eq!(engine.get(b"beta").expect("read beta"), None);
         assert_eq!(engine.get(b"gamma").expect("read gamma"), Some(b"3".to_vec()));
+    }
+
+    fs::remove_dir_all(dir).expect("cleanup temp dir");
+}
+
+#[test]
+fn engine_exposes_metrics_for_wal_memtable_and_compaction() {
+    let dir = temp_dir("metrics");
+    let options = StorageEngineOptions {
+        memtable_size_bytes: 1024 * 1024,
+        ..StorageEngineOptions::default()
+    };
+
+    {
+        let engine =
+            StorageEngine::open_with_options(&dir, options.clone()).expect("open storage engine");
+
+        engine.put(b"alpha", b"1").expect("put alpha");
+        engine.put(b"beta", b"2").expect("put beta");
+        assert_eq!(engine.get(b"alpha").expect("get alpha"), Some(b"1".to_vec()));
+        assert_eq!(engine.get(b"missing").expect("get missing"), None);
+        engine.delete(b"beta").expect("delete beta");
+
+        let mut compaction = CompactionMetrics::default();
+        compaction.record_user_write(100);
+        compaction.record_compaction_write(150);
+        compaction.mark_compaction_complete();
+        engine.set_compaction_metrics(compaction.clone());
+
+        engine.force_flush().expect("flush metrics workload");
+
+        let metrics = engine.metrics();
+        assert_eq!(metrics.puts, 2);
+        assert_eq!(metrics.deletes, 1);
+        assert_eq!(metrics.gets, 2);
+        assert_eq!(metrics.wal.appended_records, 3);
+        assert!(metrics.wal.appended_bytes > 0);
+        assert!(metrics.memtable.flushes_completed >= 1 || metrics.memtable.flushes_empty >= 1);
+        assert_eq!(metrics.compaction.user_bytes_written, compaction.user_bytes_written);
+        assert_eq!(
+            metrics.compaction.compaction_bytes_written,
+            compaction.compaction_bytes_written
+        );
+    }
+
+    {
+        let reopened = StorageEngine::open_with_options(&dir, options).expect("reopen engine");
+        let metrics = reopened.metrics();
+        assert!(metrics.wal.replayed_records >= 3);
+        assert!(metrics.wal.replayed_bytes > 0);
     }
 
     fs::remove_dir_all(dir).expect("cleanup temp dir");

@@ -3,7 +3,9 @@ pub mod snapshot;
 pub mod timestamp;
 pub mod transaction;
 
-pub use gc::{run_gc_once, GcConfig, GcStats, GcWorker, GcWorkerError};
+pub use gc::{GcConfig, GcStats, GcWorker, GcWorkerError, run_gc_once};
 pub use snapshot::{Snapshot, SnapshotRegistry};
 pub use timestamp::TimestampOracle;
-pub use transaction::{CommittedVersion, MvccStore, Transaction, TransactionError};
+pub use transaction::{
+    CommittedVersion, MvccStore, Transaction, TransactionError, TransactionMetrics,
+};

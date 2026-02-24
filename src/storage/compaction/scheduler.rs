@@ -4,9 +4,9 @@ use std::collections::{BinaryHeap, HashSet};
 use crate::storage::manifest::version::VersionSet;
 
 use super::leveled::{
-    pick_compaction as pick_leveled, LeveledCompactionConfig, LeveledCompactionPlan,
+    LeveledCompactionConfig, LeveledCompactionPlan, pick_compaction as pick_leveled,
 };
-use super::tiered::{pick_compaction as pick_tiered, TieredCompactionConfig, TieredCompactionPlan};
+use super::tiered::{TieredCompactionConfig, TieredCompactionPlan, pick_compaction as pick_tiered};
 
 #[derive(Debug, Clone)]
 pub enum CompactionStrategy {
@@ -213,6 +213,10 @@ impl CompactionScheduler {
     pub fn in_flight_count(&self) -> usize {
         self.in_flight.len()
     }
+
+    pub fn metrics_snapshot(&self) -> CompactionMetrics {
+        self.metrics.clone()
+    }
 }
 
 #[cfg(test)]
@@ -279,5 +283,16 @@ mod tests {
         assert!((waf - 2.5).abs() < f64::EPSILON);
         assert!((raf - 4.0).abs() < f64::EPSILON);
         assert!((saf - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn exposes_metrics_snapshot() {
+        let mut scheduler = CompactionScheduler::default();
+        scheduler.metrics.record_user_write(42);
+        scheduler.metrics.record_compaction_write(84);
+
+        let snapshot = scheduler.metrics_snapshot();
+        assert_eq!(snapshot.user_bytes_written, 42);
+        assert_eq!(snapshot.compaction_bytes_written, 84);
     }
 }

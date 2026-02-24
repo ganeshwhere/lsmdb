@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 use thiserror::Error;
@@ -25,6 +26,15 @@ pub enum TransactionError {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TransactionMetrics {
+    pub started: u64,
+    pub committed: u64,
+    pub rolled_back: u64,
+    pub write_conflicts: u64,
+    pub active_transactions: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PruneStats {
     pub scanned_keys: u64,
     pub removed_versions: u64,
@@ -40,6 +50,15 @@ struct MvccStoreInner {
     oracle: TimestampOracle,
     snapshots: SnapshotRegistry,
     data: RwLock<MvccStoreData>,
+    metrics: TransactionMetricsState,
+}
+
+#[derive(Debug, Default)]
+struct TransactionMetricsState {
+    started: AtomicU64,
+    committed: AtomicU64,
+    rolled_back: AtomicU64,
+    write_conflicts: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +79,7 @@ impl MvccStore {
                 oracle: TimestampOracle::default(),
                 snapshots: SnapshotRegistry::default(),
                 data: RwLock::new(MvccStoreData::default()),
+                metrics: TransactionMetricsState::default(),
             }),
         }
     }
@@ -67,6 +87,7 @@ impl MvccStore {
     pub fn begin_transaction(&self) -> Transaction {
         let read_ts = self.inner.oracle.current();
         let snapshot = self.inner.snapshots.pin(read_ts);
+        self.inner.metrics.started.fetch_add(1, Ordering::Relaxed);
         debug!(read_ts, "begin transaction");
         Transaction {
             store: self.clone(),
@@ -86,6 +107,16 @@ impl MvccStore {
 
     pub fn active_snapshot_count(&self) -> usize {
         self.inner.snapshots.active_snapshot_count()
+    }
+
+    pub fn metrics(&self) -> TransactionMetrics {
+        TransactionMetrics {
+            started: self.inner.metrics.started.load(Ordering::Relaxed),
+            committed: self.inner.metrics.committed.load(Ordering::Relaxed),
+            rolled_back: self.inner.metrics.rolled_back.load(Ordering::Relaxed),
+            write_conflicts: self.inner.metrics.write_conflicts.load(Ordering::Relaxed),
+            active_transactions: self.active_snapshot_count(),
+        }
     }
 
     pub fn gc_watermark_timestamp(&self) -> u64 {
@@ -169,6 +200,7 @@ impl MvccStore {
             if let Some(versions) = data.versions.get(key) {
                 if let Some(latest) = versions.last() {
                     if latest.commit_ts > read_ts {
+                        self.inner.metrics.write_conflicts.fetch_add(1, Ordering::Relaxed);
                         warn!(
                             key = %String::from_utf8_lossy(key),
                             read_ts,
@@ -312,17 +344,23 @@ impl Transaction {
             snapshot.release();
         }
 
+        self.store.inner.metrics.committed.fetch_add(1, Ordering::Relaxed);
         debug!(commit_ts, "transaction committed");
         Ok(commit_ts)
     }
 
     pub fn rollback(&mut self) {
+        if self.closed {
+            return;
+        }
+
         debug!(write_count = self.writes.len(), "rollback transaction");
         self.writes.clear();
         self.closed = true;
         if let Some(mut snapshot) = self.snapshot.take() {
             snapshot.release();
         }
+        self.store.inner.metrics.rolled_back.fetch_add(1, Ordering::Relaxed);
     }
 }
 

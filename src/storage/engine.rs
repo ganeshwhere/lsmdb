@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -10,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, info, trace, warn};
 
+use super::compaction::CompactionMetrics;
 use super::manifest::version::SSTableMetadata;
 use super::manifest::{Manifest, ManifestError, VersionEdit};
 use super::memtable::{MemTable, MemTableManager, ValueType, decode_internal_key};
@@ -68,6 +70,35 @@ pub enum EngineError {
     BackgroundFlush(String),
     #[error("background flush timed out after {0:?}")]
     FlushTimeout(Duration),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalMetricsSnapshot {
+    pub appended_records: u64,
+    pub appended_bytes: u64,
+    pub replayed_records: u64,
+    pub replayed_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemTableMetricsSnapshot {
+    pub mutable_size_bytes: usize,
+    pub immutable_tables: usize,
+    pub pending_flush_tables: usize,
+    pub flushes_completed: u64,
+    pub flushes_empty: u64,
+    pub flushes_failed: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct StorageEngineMetrics {
+    pub puts: u64,
+    pub deletes: u64,
+    pub gets: u64,
+    pub wal: WalMetricsSnapshot,
+    pub memtable: MemTableMetricsSnapshot,
+    pub sstable_count: usize,
+    pub compaction: CompactionMetrics,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +168,37 @@ enum FlushResponse {
     Failed { memtable: Arc<MemTable>, error: String },
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct WalReplayStats {
+    max_sequence: u64,
+    replayed_records: u64,
+    replayed_bytes: u64,
+}
+
+#[derive(Debug, Default)]
+struct EngineMetricsState {
+    puts: AtomicU64,
+    deletes: AtomicU64,
+    gets: AtomicU64,
+    wal_appended_records: AtomicU64,
+    wal_appended_bytes: AtomicU64,
+    wal_replayed_records: AtomicU64,
+    wal_replayed_bytes: AtomicU64,
+    flushes_completed: AtomicU64,
+    flushes_empty: AtomicU64,
+    flushes_failed: AtomicU64,
+    compaction: Mutex<CompactionMetrics>,
+}
+
+impl EngineMetricsState {
+    fn from_replay(stats: WalReplayStats) -> Self {
+        let metrics = Self::default();
+        metrics.wal_replayed_records.store(stats.replayed_records, Ordering::Relaxed);
+        metrics.wal_replayed_bytes.store(stats.replayed_bytes, Ordering::Relaxed);
+        metrics
+    }
+}
+
 #[derive(Debug)]
 pub struct StorageEngine {
     root_dir: PathBuf,
@@ -146,6 +208,7 @@ pub struct StorageEngine {
     wal_writer: Mutex<WalWriter>,
     manifest: Mutex<Manifest>,
     state: Mutex<EngineState>,
+    metrics: EngineMetricsState,
     flush_tx: Sender<FlushRequest>,
     flush_rx: Mutex<Receiver<FlushResponse>>,
     flush_thread: Mutex<Option<JoinHandle<()>>>,
@@ -188,9 +251,11 @@ impl StorageEngine {
             options.memtable_size_bytes,
             options.memtable_arena_block_size_bytes,
         );
-        let recovered_max_sequence = recover_from_wal(&wal_dir, &mut memtables)?;
+        let replay_stats = recover_from_wal(&wal_dir, &mut memtables)?;
+        let recovered_max_sequence = replay_stats.max_sequence;
         debug!(
             recovered_max_sequence,
+            wal_replayed_records = replay_stats.replayed_records,
             recovered_immutable_memtables = memtables.immutable_count(),
             "wal replay completed"
         );
@@ -222,6 +287,7 @@ impl StorageEngine {
                 next_sequence: recovered_max_sequence,
                 next_table_id,
             }),
+            metrics: EngineMetricsState::from_replay(replay_stats),
             flush_tx,
             flush_rx: Mutex::new(result_rx),
             flush_thread: Mutex::new(Some(flush_thread)),
@@ -258,6 +324,7 @@ impl StorageEngine {
         let mut state = self.state.lock();
         state.memtables.put(key, sequence, value);
         self.schedule_pending_flushes_locked(&mut state)?;
+        self.metrics.puts.fetch_add(1, Ordering::Relaxed);
 
         Ok(sequence)
     }
@@ -278,12 +345,14 @@ impl StorageEngine {
         let mut state = self.state.lock();
         state.memtables.delete(key, sequence);
         self.schedule_pending_flushes_locked(&mut state)?;
+        self.metrics.deletes.fetch_add(1, Ordering::Relaxed);
 
         Ok(sequence)
     }
 
     pub fn get(&self, user_key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
         self.drain_flush_results()?;
+        self.metrics.gets.fetch_add(1, Ordering::Relaxed);
         trace!(key_len = user_key.len(), "read request");
 
         let (mutable, immutables, sstable_readers) = {
@@ -374,11 +443,55 @@ impl StorageEngine {
         self.state.lock().sstables.iter().map(|runtime| runtime.metadata.clone()).collect()
     }
 
+    pub fn metrics(&self) -> StorageEngineMetrics {
+        let (mutable_size_bytes, immutable_tables, pending_flush_tables, sstable_count) = {
+            let state = self.state.lock();
+            (
+                state.memtables.mutable().approximate_size_bytes(),
+                state.memtables.immutable_count(),
+                state.pending_flush.len(),
+                state.sstables.len(),
+            )
+        };
+
+        StorageEngineMetrics {
+            puts: self.metrics.puts.load(Ordering::Relaxed),
+            deletes: self.metrics.deletes.load(Ordering::Relaxed),
+            gets: self.metrics.gets.load(Ordering::Relaxed),
+            wal: WalMetricsSnapshot {
+                appended_records: self.metrics.wal_appended_records.load(Ordering::Relaxed),
+                appended_bytes: self.metrics.wal_appended_bytes.load(Ordering::Relaxed),
+                replayed_records: self.metrics.wal_replayed_records.load(Ordering::Relaxed),
+                replayed_bytes: self.metrics.wal_replayed_bytes.load(Ordering::Relaxed),
+            },
+            memtable: MemTableMetricsSnapshot {
+                mutable_size_bytes,
+                immutable_tables,
+                pending_flush_tables,
+                flushes_completed: self.metrics.flushes_completed.load(Ordering::Relaxed),
+                flushes_empty: self.metrics.flushes_empty.load(Ordering::Relaxed),
+                flushes_failed: self.metrics.flushes_failed.load(Ordering::Relaxed),
+            },
+            sstable_count,
+            compaction: self.metrics.compaction.lock().clone(),
+        }
+    }
+
+    pub fn compaction_metrics(&self) -> CompactionMetrics {
+        self.metrics.compaction.lock().clone()
+    }
+
+    pub fn set_compaction_metrics(&self, metrics: CompactionMetrics) {
+        *self.metrics.compaction.lock() = metrics;
+    }
+
     fn append_wal(&self, operation: &WalOperation) -> Result<(), EngineError> {
         let payload = bincode::serialize(operation)
             .map_err(|err| EngineError::Serialization(err.to_string()))?;
         let mut writer = self.wal_writer.lock();
         writer.append_and_commit(&payload)?;
+        self.metrics.wal_appended_records.fetch_add(1, Ordering::Relaxed);
+        self.metrics.wal_appended_bytes.fetch_add(payload.len() as u64, Ordering::Relaxed);
         trace!(payload_len = payload.len(), "wal append committed");
         Ok(())
     }
@@ -477,6 +590,7 @@ impl StorageEngine {
                 state.pending_flush.remove(&marker);
                 state.memtables.remove_immutable(&completed.memtable);
                 state.sstables.insert(0, SSTableRuntime { metadata, reader });
+                self.metrics.flushes_completed.fetch_add(1, Ordering::Relaxed);
             }
             FlushResponse::Empty { memtable } => {
                 let marker = Arc::as_ptr(&memtable) as usize;
@@ -484,11 +598,13 @@ impl StorageEngine {
                 state.pending_flush.remove(&marker);
                 state.memtables.remove_immutable(&memtable);
                 debug!("dropped empty immutable memtable");
+                self.metrics.flushes_empty.fetch_add(1, Ordering::Relaxed);
             }
             FlushResponse::Failed { memtable, error } => {
                 let marker = Arc::as_ptr(&memtable) as usize;
                 self.state.lock().pending_flush.remove(&marker);
                 warn!(error = %error, "memtable flush failed");
+                self.metrics.flushes_failed.fetch_add(1, Ordering::Relaxed);
                 return Err(EngineError::BackgroundFlush(error));
             }
         }
@@ -548,13 +664,19 @@ fn flush_one_memtable(task: FlushTask) -> FlushResponse {
     }
 }
 
-fn recover_from_wal(wal_dir: &Path, memtables: &mut MemTableManager) -> Result<u64, EngineError> {
+fn recover_from_wal(
+    wal_dir: &Path,
+    memtables: &mut MemTableManager,
+) -> Result<WalReplayStats, EngineError> {
     let reader = WalReader::open(wal_dir)?;
     let replay = reader.replay()?;
 
     let mut max_sequence = 0_u64;
+    let replayed_records = replay.records.len() as u64;
+    let mut replayed_bytes = 0_u64;
 
     for payload in replay.records {
+        replayed_bytes = replayed_bytes.saturating_add(payload.len() as u64);
         let operation: WalOperation = bincode::deserialize(&payload)
             .map_err(|err| EngineError::Serialization(err.to_string()))?;
 
@@ -570,7 +692,7 @@ fn recover_from_wal(wal_dir: &Path, memtables: &mut MemTableManager) -> Result<u
         }
     }
 
-    Ok(max_sequence)
+    Ok(WalReplayStats { max_sequence, replayed_records, replayed_bytes })
 }
 
 fn resolve_from_memtable(table: &MemTable, user_key: &[u8]) -> Option<ResolvedVersion> {

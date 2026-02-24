@@ -58,3 +58,32 @@ fn deletes_are_versioned_and_visible_after_commit() {
     let reader_after_delete = store.begin_transaction();
     assert_eq!(reader_after_delete.get(b"k").expect("read after delete"), None);
 }
+
+#[test]
+fn mvcc_exposes_transaction_metrics() {
+    let store = MvccStore::new();
+
+    let mut tx_commit = store.begin_transaction();
+    tx_commit.put(b"m/key", b"v1").expect("tx_commit write");
+    tx_commit.commit().expect("tx_commit commit");
+
+    let mut tx_rollback = store.begin_transaction();
+    tx_rollback.put(b"m/key2", b"v2").expect("tx_rollback write");
+    tx_rollback.rollback();
+
+    let mut tx_a = store.begin_transaction();
+    let mut tx_b = store.begin_transaction();
+    tx_a.put(b"m/conflict", b"a").expect("tx_a write");
+    tx_b.put(b"m/conflict", b"b").expect("tx_b write");
+    tx_a.commit().expect("tx_a commit");
+    let err = tx_b.commit().expect_err("tx_b conflict");
+    assert!(matches!(err, TransactionError::WriteWriteConflict { .. }));
+    tx_b.rollback();
+
+    let metrics = store.metrics();
+    assert_eq!(metrics.started, 4);
+    assert_eq!(metrics.committed, 2);
+    assert_eq!(metrics.rolled_back, 2);
+    assert_eq!(metrics.write_conflicts, 1);
+    assert_eq!(metrics.active_transactions, 0);
+}
