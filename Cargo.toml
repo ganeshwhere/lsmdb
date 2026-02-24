@@ -44,6 +44,11 @@ name = "sqlite_wal_baseline"
 harness = false
 path = "tests/bench/sqlite_wal_baseline.rs"
 
+[[bench]]
+name = "sqlite_read_baseline"
+harness = false
+path = "tests/bench/sqlite_read_baseline.rs"
+
 [dependencies]
 bincode = "1.3"
 bytes = "1.7"
