@@ -4,14 +4,16 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crc32fast::Hasher;
 use parking_lot::{Mutex, RwLock};
 use thiserror::Error;
 
 use super::block::{BlockDecodeError, DataBlock};
 use super::bloom::{BloomDecodeError, BloomFilter};
 use super::builder::{
-    FILTER_META_KEY, FooterDecodeError, MetaIndex, MetaIndexError, SSTABLE_FOOTER_SIZE_BYTES,
-    decode_footer,
+    FILTER_META_KEY, FooterDecodeError, MetaIndex, MetaIndexError,
+    SSTABLE_FOOTER_CHECKSUM_OFFSET_BYTES, SSTABLE_FOOTER_CHECKSUM_SIZE_BYTES,
+    SSTABLE_FOOTER_SIZE_BYTES, decode_footer,
 };
 use super::index::{BlockHandle, IndexBlock, IndexDecodeError};
 
@@ -31,6 +33,8 @@ pub enum SSTableReadError {
     BloomDecode(#[from] BloomDecodeError),
     #[error("invalid data block: {0}")]
     DataBlock(#[from] BlockDecodeError),
+    #[error("SSTable checksum mismatch: expected {expected:#x}, found {found:#x}")]
+    ChecksumMismatch { expected: u64, found: u64 },
 }
 
 #[derive(Debug)]
@@ -57,6 +61,7 @@ impl SSTableReader {
         let mut footer_bytes = [0_u8; SSTABLE_FOOTER_SIZE_BYTES];
         file.read_exact(&mut footer_bytes)?;
         let footer = decode_footer(&footer_bytes)?;
+        verify_checksum(&mut file, file_size, footer.checksum)?;
 
         let index_bytes = read_handle_bytes(&mut file, footer.index_handle)?;
         let index = IndexBlock::decode(&index_bytes)?;
@@ -169,6 +174,56 @@ fn read_handle_bytes(file: &mut File, handle: BlockHandle) -> Result<Vec<u8>, io
     Ok(bytes)
 }
 
+fn verify_checksum(file: &mut File, file_size: u64, expected: u64) -> Result<(), SSTableReadError> {
+    let found = compute_file_checksum(file, file_size)? as u64;
+    if found != expected {
+        return Err(SSTableReadError::ChecksumMismatch { expected, found });
+    }
+
+    Ok(())
+}
+
+fn compute_file_checksum(file: &mut File, file_size: u64) -> io::Result<u32> {
+    let footer_start = file_size
+        .checked_sub(SSTABLE_FOOTER_SIZE_BYTES as u64)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid footer bounds"))?;
+    let checksum_start = footer_start
+        .checked_add(SSTABLE_FOOTER_CHECKSUM_OFFSET_BYTES as u64)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid checksum bounds"))?;
+    let checksum_end = checksum_start
+        .checked_add(SSTABLE_FOOTER_CHECKSUM_SIZE_BYTES as u64)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid checksum bounds"))?;
+
+    let mut hasher = Hasher::new();
+    file.seek(SeekFrom::Start(0))?;
+
+    let mut offset = 0_u64;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+
+        let chunk_start = offset;
+        let chunk_end = offset.saturating_add(read as u64);
+
+        if chunk_start < checksum_end && chunk_end > checksum_start {
+            let mut sanitized = buffer[..read].to_vec();
+            let zero_start = checksum_start.saturating_sub(chunk_start) as usize;
+            let zero_end = checksum_end.min(chunk_end).saturating_sub(chunk_start) as usize;
+            sanitized[zero_start..zero_end].fill(0);
+            hasher.update(&sanitized);
+        } else {
+            hasher.update(&buffer[..read]);
+        }
+
+        offset = chunk_end;
+    }
+
+    Ok(hasher.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -231,6 +286,29 @@ mod tests {
 
         let err = SSTableReader::open(&path).expect_err("tiny file should fail");
         assert!(matches!(err, SSTableReadError::FileTooSmall(_)));
+
+        fs::remove_dir_all(dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rejects_corrupted_file_with_checksum_mismatch() {
+        let dir = temp_dir("checksum-mismatch");
+        let path = dir.join("table.sst");
+
+        let mut builder = SSTableBuilder::create(&path).expect("create builder");
+        for i in 0..32_u32 {
+            let key = format!("k{i:04}");
+            let value = format!("value-{i:04}");
+            builder.add(key.as_bytes(), value.as_bytes()).expect("add sorted row");
+        }
+        builder.finish().expect("finish table");
+
+        let mut bytes = fs::read(&path).expect("read sstable bytes");
+        bytes[0] ^= 0x5A;
+        fs::write(&path, bytes).expect("write corrupted sstable");
+
+        let err = SSTableReader::open(&path).expect_err("corrupted file should fail checksum");
+        assert!(matches!(err, SSTableReadError::ChecksumMismatch { .. }));
 
         fs::remove_dir_all(dir).expect("cleanup temp dir");
     }

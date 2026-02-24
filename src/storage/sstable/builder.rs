@@ -2,6 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+use crc32fast::Hasher;
 use thiserror::Error;
 
 use super::block::{BlockBuildError, DEFAULT_RESTART_INTERVAL, DataBlockBuilder};
@@ -11,12 +12,15 @@ use super::index::{BlockHandle, IndexBlock, IndexBuildError, IndexEntry};
 pub const DEFAULT_DATA_BLOCK_SIZE_BYTES: usize = 4 * 1024;
 pub const SSTABLE_FOOTER_SIZE_BYTES: usize = 48;
 pub const SSTABLE_MAGIC: u64 = 0xdb47_7524_8b80_fb57;
+pub const SSTABLE_FOOTER_CHECKSUM_OFFSET_BYTES: usize = 32;
+pub const SSTABLE_FOOTER_CHECKSUM_SIZE_BYTES: usize = 8;
 pub(crate) const FILTER_META_KEY: &str = "filter.bloom";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Footer {
     pub metaindex_handle: BlockHandle,
     pub index_handle: BlockHandle,
+    pub checksum: u64,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -27,14 +31,20 @@ pub enum FooterDecodeError {
     InvalidMagic { expected: u64, found: u64 },
 }
 
-pub fn encode_footer(metaindex_handle: BlockHandle, index_handle: BlockHandle) -> [u8; 48] {
+pub fn encode_footer(
+    metaindex_handle: BlockHandle,
+    index_handle: BlockHandle,
+    checksum: u64,
+) -> [u8; 48] {
     let mut footer = [0_u8; SSTABLE_FOOTER_SIZE_BYTES];
 
     footer[0..8].copy_from_slice(&metaindex_handle.offset.to_le_bytes());
     footer[8..16].copy_from_slice(&metaindex_handle.size.to_le_bytes());
     footer[16..24].copy_from_slice(&index_handle.offset.to_le_bytes());
     footer[24..32].copy_from_slice(&index_handle.size.to_le_bytes());
-    // bytes [32..40] reserved for future extensions.
+    footer[SSTABLE_FOOTER_CHECKSUM_OFFSET_BYTES
+        ..SSTABLE_FOOTER_CHECKSUM_OFFSET_BYTES + SSTABLE_FOOTER_CHECKSUM_SIZE_BYTES]
+        .copy_from_slice(&checksum.to_le_bytes());
     footer[40..48].copy_from_slice(&SSTABLE_MAGIC.to_le_bytes());
 
     footer
@@ -55,6 +65,7 @@ pub fn decode_footer(bytes: &[u8]) -> Result<Footer, FooterDecodeError> {
     Ok(Footer {
         metaindex_handle: BlockHandle { offset: read_u64(bytes, 0), size: read_u64(bytes, 8) },
         index_handle: BlockHandle { offset: read_u64(bytes, 16), size: read_u64(bytes, 24) },
+        checksum: read_u64(bytes, SSTABLE_FOOTER_CHECKSUM_OFFSET_BYTES),
     })
 }
 
@@ -193,6 +204,7 @@ pub struct SSTableBuilder {
     data_block_count: usize,
     entry_count: usize,
     finished: bool,
+    checksum_hasher: Hasher,
 }
 
 impl SSTableBuilder {
@@ -231,6 +243,7 @@ impl SSTableBuilder {
             data_block_count: 0,
             entry_count: 0,
             finished: false,
+            checksum_hasher: Hasher::new(),
         })
     }
 
@@ -281,7 +294,8 @@ impl SSTableBuilder {
         let index_block = IndexBlock::from_entries(self.index_entries.clone())?;
         let index_handle = self.write_block(&index_block.encode())?;
 
-        let footer = encode_footer(metaindex_handle, index_handle);
+        let checksum = self.compute_checksum(metaindex_handle, index_handle);
+        let footer = encode_footer(metaindex_handle, index_handle, checksum);
         self.writer.write_all(&footer)?;
         self.current_offset = self
             .current_offset
@@ -319,8 +333,16 @@ impl SSTableBuilder {
     fn write_block(&mut self, bytes: &[u8]) -> Result<BlockHandle, io::Error> {
         let handle = BlockHandle { offset: self.current_offset, size: bytes.len() as u64 };
         self.writer.write_all(bytes)?;
+        self.checksum_hasher.update(bytes);
         self.current_offset = self.current_offset.saturating_add(bytes.len() as u64);
         Ok(handle)
+    }
+
+    fn compute_checksum(&self, metaindex_handle: BlockHandle, index_handle: BlockHandle) -> u64 {
+        let mut hasher = self.checksum_hasher.clone();
+        let footer_without_checksum = encode_footer(metaindex_handle, index_handle, 0);
+        hasher.update(&footer_without_checksum);
+        hasher.finalize() as u64
     }
 }
 
@@ -371,11 +393,13 @@ mod tests {
         let footer = encode_footer(
             BlockHandle { offset: 100, size: 20 },
             BlockHandle { offset: 120, size: 30 },
+            0xA1_B2_C3_D4,
         );
         let decoded = decode_footer(&footer).expect("decode footer");
 
         assert_eq!(decoded.metaindex_handle.offset, 100);
         assert_eq!(decoded.index_handle.offset, 120);
+        assert_eq!(decoded.checksum, 0xA1_B2_C3_D4);
     }
 
     #[test]
