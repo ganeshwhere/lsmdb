@@ -1,0 +1,228 @@
+# LSMDB Context Handoff
+
+This file is a high-signal handoff for future AI sessions working on this repository.
+
+## 1) Repository Orientation
+
+- Actual Rust project root is: `db/`
+- Git repository is initialized in `db/.git`
+- Top-level sibling folders (`/docs`, `/src`, `/tests`, `/tools` outside `db/`) are scaffolds and mostly empty
+- Work should usually happen under:
+  - `db/src/`
+  - `db/tests/`
+  - `db/tools/`
+  - `db/docs/`
+
+## 2) Project Goal
+
+LSM-tree based relational database in Rust with:
+- durable storage primitives (WAL, MemTable, SSTable, Manifest, Engine)
+- MVCC transactions
+- SQL parser/planner/executor
+- TCP server + CLI
+- benchmark suite
+
+## 3) Current Architecture (Important Reality)
+
+There are **two active tracks** in the codebase right now:
+
+1. Persistent storage engine track (`src/storage/*`)
+- WAL + MemTable + SSTable + Manifest + StorageEngine
+- Disk-backed
+- Crash recovery + graceful shutdown + SSTable checksum validation implemented
+
+2. SQL execution track (`src/mvcc`, `src/catalog`, `src/sql`, `src/planner`, `src/executor`, `src/server`)
+- Backed by `MvccStore` in memory (`HashMap` versions)
+- Not yet wired to `StorageEngine`
+- Good for SQL flow and MVCC semantics testing, but not process-restart durable
+
+Do not assume SQL path currently persists via LSM storage files.
+
+## 4) What Is Implemented
+
+### Storage
+
+- `src/storage/wal`
+  - Record encoding with CRC
+  - Segment rotation
+  - Replay with corrupted-tail handling
+- `src/storage/memtable`
+  - Arena + skiplist + mutable/immutable table flow
+- `src/storage/sstable`
+  - Data blocks + index + bloom filter + footer
+  - Reader with range and point access
+  - Full-file checksum validation on open
+- `src/storage/manifest`
+  - Version edit log and version set replay
+- `src/storage/engine`
+  - Coordinated write/read/flush path
+  - Background flush worker
+  - Metrics snapshots
+  - Graceful shutdown (`shutdown()`): flush memtable, sync WAL, sync manifest, stop worker
+
+### Compaction
+
+- `src/storage/compaction`
+  - Leveled + tiered planning
+  - Scheduler + amplification metrics
+- Current state: mostly planning/scheduler layer, not fully integrated as automatic engine compaction loop
+
+### MVCC
+
+- `src/mvcc`
+  - Snapshot isolation semantics
+  - Timestamp oracle
+  - Write-write conflict detection
+  - GC worker and prune stats
+- Current state: in-memory store, independent of persistent storage engine
+
+### Catalog
+
+- `src/catalog`
+  - Table/column schema descriptors and validation
+  - Catalog read/write via `MvccStore`
+  - In-memory cache + refresh
+  - Concurrent DDL race behavior tests
+
+### SQL / Planner / Executor
+
+- `src/sql`
+  - Lexer + parser + AST + validator
+- `src/planner`
+  - Logical + rule-based rewrite + physical plan selection
+  - PK equality predicate can produce `PrimaryKeyScan`
+- `src/executor`
+  - DDL + DML + query execution + expression evaluation
+  - Session transaction handling (`BEGIN`, `COMMIT`, `ROLLBACK`)
+  - DDL inside explicit tx currently rejected
+
+### Server + Protocol + CLI
+
+- `src/server`
+  - Tokio TCP server
+  - Custom framed protocol
+  - Per-connection execution session
+- `tools/lsmdb-cli/main.rs`
+  - REPL client
+  - Meta commands: `\help`, `\q`, `\timing`, `\explain <sql>`
+
+## 5) SQL Surface (Implemented Subset)
+
+Supported statement families in AST/parser:
+- `CREATE TABLE`
+- `DROP TABLE`
+- `INSERT`
+- `SELECT ... WHERE ... ORDER BY ... LIMIT ...`
+- `UPDATE ... SET ... WHERE ...`
+- `DELETE ... WHERE ...`
+- `BEGIN [ISOLATION LEVEL SNAPSHOT]`
+- `COMMIT`
+- `ROLLBACK`
+
+## 6) Config / Observability / Hardening
+
+- Config loader: `src/config/mod.rs`
+  - TOML parsing + validation
+  - Runtime conversion for storage + compaction options
+- Example config file: `lsmdb.toml`
+- Structured tracing setup: `src/observability/*`
+- Error handling has been significantly moved to typed `thiserror` paths
+
+## 7) Test & Benchmark Coverage
+
+### Integration tests (`tests/integration`)
+
+- `wal_recovery.rs`
+- `engine_recovery.rs`
+- `compaction.rs`
+- `mvcc_isolation.rs`
+- `catalog.rs`
+- `sql_e2e.rs`
+- `planner.rs`
+- `executor.rs`
+- `server.rs`
+
+### Benchmarks (`tests/bench`)
+
+- `write_throughput.rs`
+- `read_latency.rs`
+- `mixed_read_write.rs`
+- `compaction_amplification.rs`
+- `wal_recovery.rs`
+- `concurrent_txn_throughput.rs`
+- `sqlite_wal_baseline.rs`
+- `sqlite_read_baseline.rs`
+
+Registered in `Cargo.toml` as `[[bench]]` targets.
+
+## 8) Known Gaps / Risks
+
+- SQL path is not yet backed by persistent storage engine (`StorageEngine` not wired into executor/server)
+- Compaction planner/scheduler exists, but end-to-end on-disk compaction integration is incomplete
+- `db/README.md` and `db/docs/*.md` are mostly scaffold text and lag behind implementation
+- Only CLI binary is present; no standalone server binary target in `Cargo.toml` yet
+
+## 9) Runbook
+
+From project root:
+
+```bash
+cd db
+```
+
+Common commands:
+
+```bash
+cargo fmt --all
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+```
+
+Run CLI:
+
+```bash
+cargo run --bin lsmdb-cli -- --addr 127.0.0.1:7878
+```
+
+Run one benchmark target:
+
+```bash
+cargo bench --bench write_throughput
+cargo bench --bench read_latency
+cargo bench --bench sqlite_wal_baseline
+```
+
+Notes:
+- Some environments in this project history had offline dependency resolution failures (`index.crates.io` unavailable). If that happens, run with network access or ensure dependencies are cached.
+
+## 10) Recent Milestones (Latest Commits)
+
+- `990338b` test(catalog): add concurrent DDL race coverage for drop and create
+- `f586630` test(bench): add SQLite WAL point-read latency baseline comparison
+- `ee67a8b` test(bench): add SQLite WAL baseline write-throughput comparison
+- `eeffce9` test(bench): add concurrent transaction throughput benchmark for MVCC
+- `ec71793` feat(sstable): add full-file checksum validation on open
+- `5461b17` feat(engine): implement graceful shutdown with memtable flush and WAL sync
+- `4e1d8a6` feat(config): add TOML configuration with validated deserialization
+- `fd479cf` feat(metrics): expose compaction, WAL, memtable, and transaction counters
+- `103d31a` feat(observability): add structured tracing with span-level instrumentation
+
+## 11) Collaboration Conventions (Project-Specific)
+
+- Commit style: Conventional Commit subject + bullet-point body lines
+- Prefer concise, concrete commit scopes (`feat(engine)`, `test(bench)`, etc.)
+- Avoid adding planning narrative or personal details into README
+- If user asks to fix content in the previous commit, prefer amend workflow when requested
+
+## 12) Recommended Next Steps
+
+Highest impact:
+1. Wire SQL executor/server persistence path to `StorageEngine` (replace in-memory `MvccStore` backend or bridge it)
+2. Integrate compaction execution into storage engine lifecycle
+3. Add standalone server binary and config-driven startup
+4. Refresh `README.md` and `docs/*.md` to match real implementation status
+
+Good follow-ups:
+1. Add end-to-end restart-durability tests through SQL/server surface
+2. Add CI job(s) for selected benchmark smoke checks
+3. Expand corruption/chaos tests around WAL + manifest + SSTable boundaries
