@@ -1,17 +1,18 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::{debug, info, trace, warn};
 
 use super::manifest::version::SSTableMetadata;
 use super::manifest::{Manifest, ManifestError, VersionEdit};
-use super::memtable::{decode_internal_key, MemTable, MemTableManager, ValueType};
+use super::memtable::{MemTable, MemTableManager, ValueType, decode_internal_key};
 use super::sstable::{
     SSTableBuildError, SSTableBuildSummary, SSTableBuilder, SSTableBuilderOptions,
     SSTableReadError, SSTableReader,
@@ -160,6 +161,12 @@ impl StorageEngine {
         options: StorageEngineOptions,
     ) -> Result<Self, EngineError> {
         let root_dir = root_dir.as_ref().to_path_buf();
+        info!(
+            root_dir = %root_dir.display(),
+            memtable_size_bytes = options.memtable_size_bytes,
+            wal_segment_size_bytes = options.wal_options.segment_size_bytes,
+            "opening storage engine"
+        );
         let wal_dir = root_dir.join(WAL_DIR_NAME);
         let sstable_dir = root_dir.join(SSTABLE_DIR_NAME);
         let manifest_dir = root_dir.join(MANIFEST_DIR_NAME);
@@ -182,6 +189,11 @@ impl StorageEngine {
             options.memtable_arena_block_size_bytes,
         );
         let recovered_max_sequence = recover_from_wal(&wal_dir, &mut memtables)?;
+        debug!(
+            recovered_max_sequence,
+            recovered_immutable_memtables = memtables.immutable_count(),
+            "wal replay completed"
+        );
 
         let next_table_id =
             manifest.version_set().max_table_id().map(|id| id.saturating_add(1)).unwrap_or(1);
@@ -221,6 +233,11 @@ impl StorageEngine {
         }
 
         engine.drain_flush_results()?;
+        info!(
+            sstable_count = engine.sstable_count(),
+            immutable_memtables = engine.immutable_memtable_count(),
+            "storage engine opened"
+        );
 
         Ok(engine)
     }
@@ -236,6 +253,7 @@ impl StorageEngine {
 
         let operation = WalOperation::Put { key: key.to_vec(), value: value.to_vec(), sequence };
         self.append_wal(&operation)?;
+        trace!(sequence, key_len = key.len(), value_len = value.len(), "put appended to wal");
 
         let mut state = self.state.lock();
         state.memtables.put(key, sequence, value);
@@ -255,6 +273,7 @@ impl StorageEngine {
 
         let operation = WalOperation::Delete { key: key.to_vec(), sequence };
         self.append_wal(&operation)?;
+        trace!(sequence, key_len = key.len(), "delete appended to wal");
 
         let mut state = self.state.lock();
         state.memtables.delete(key, sequence);
@@ -265,6 +284,7 @@ impl StorageEngine {
 
     pub fn get(&self, user_key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
         self.drain_flush_results()?;
+        trace!(key_len = user_key.len(), "read request");
 
         let (mutable, immutables, sstable_readers) = {
             let state = self.state.lock();
@@ -297,6 +317,7 @@ impl StorageEngine {
 
     pub fn force_flush(&self) -> Result<(), EngineError> {
         self.drain_flush_results()?;
+        info!("force flush requested");
 
         {
             let mut state = self.state.lock();
@@ -317,6 +338,7 @@ impl StorageEngine {
 
             let pending = self.state.lock().pending_flush.len();
             if pending == 0 {
+                debug!("background flush drained");
                 return Ok(());
             }
 
@@ -357,6 +379,7 @@ impl StorageEngine {
             .map_err(|err| EngineError::Serialization(err.to_string()))?;
         let mut writer = self.wal_writer.lock();
         writer.append_and_commit(&payload)?;
+        trace!(payload_len = payload.len(), "wal append committed");
         Ok(())
     }
 
@@ -381,6 +404,7 @@ impl StorageEngine {
             self.flush_tx.send(FlushRequest::Flush(task)).map_err(|_| {
                 EngineError::BackgroundFlush("flush worker channel is closed".to_string())
             })?;
+            debug!(table_id, "scheduled memtable flush");
             state.pending_flush.insert(marker);
         }
 
@@ -436,6 +460,11 @@ impl StorageEngine {
                     largest_key: completed.largest_key,
                     file_size_bytes: completed.summary.file_size_bytes,
                 };
+                info!(
+                    table_id = metadata.table_id,
+                    file_size_bytes = metadata.file_size_bytes,
+                    "applied flushed sstable"
+                );
 
                 {
                     let mut manifest = self.manifest.lock();
@@ -454,10 +483,12 @@ impl StorageEngine {
                 let mut state = self.state.lock();
                 state.pending_flush.remove(&marker);
                 state.memtables.remove_immutable(&memtable);
+                debug!("dropped empty immutable memtable");
             }
             FlushResponse::Failed { memtable, error } => {
                 let marker = Arc::as_ptr(&memtable) as usize;
                 self.state.lock().pending_flush.remove(&marker);
+                warn!(error = %error, "memtable flush failed");
                 return Err(EngineError::BackgroundFlush(error));
             }
         }
@@ -468,6 +499,7 @@ impl StorageEngine {
 
 impl Drop for StorageEngine {
     fn drop(&mut self) {
+        debug!("shutting down storage engine");
         let _ = self.flush_tx.send(FlushRequest::Shutdown);
         if let Some(handle) = self.flush_thread.lock().take() {
             let _ = handle.join();

@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 use thiserror::Error;
+use tracing::{debug, trace, warn};
 
 use super::snapshot::{Snapshot, SnapshotRegistry};
 use super::timestamp::TimestampOracle;
@@ -66,6 +67,7 @@ impl MvccStore {
     pub fn begin_transaction(&self) -> Transaction {
         let read_ts = self.inner.oracle.current();
         let snapshot = self.inner.snapshots.pin(read_ts);
+        debug!(read_ts, "begin transaction");
         Transaction {
             store: self.clone(),
             snapshot: Some(snapshot),
@@ -156,8 +158,10 @@ impl MvccStore {
         writes: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     ) -> Result<u64, TransactionError> {
         if writes.is_empty() {
+            trace!(read_ts, "commit with empty write set");
             return Ok(read_ts);
         }
+        trace!(read_ts, write_count = writes.len(), "commit write set");
 
         let mut data = self.inner.data.write();
 
@@ -165,6 +169,12 @@ impl MvccStore {
             if let Some(versions) = data.versions.get(key) {
                 if let Some(latest) = versions.last() {
                     if latest.commit_ts > read_ts {
+                        warn!(
+                            key = %String::from_utf8_lossy(key),
+                            read_ts,
+                            conflicting_commit_ts = latest.commit_ts,
+                            "write-write conflict detected"
+                        );
                         return Err(TransactionError::WriteWriteConflict {
                             key: String::from_utf8_lossy(key).into_owned(),
                             read_ts,
@@ -182,6 +192,7 @@ impl MvccStore {
             entry.push(CommittedVersion { commit_ts, value: value.clone() });
         }
 
+        trace!(commit_ts, write_count = writes.len(), "commit applied");
         Ok(commit_ts)
     }
 
@@ -292,6 +303,7 @@ impl Transaction {
         }
 
         let read_ts = self.read_ts()?;
+        debug!(read_ts, write_count = self.writes.len(), "commit transaction");
         let commit_ts = self.store.commit_writes(read_ts, &self.writes)?;
 
         self.writes.clear();
@@ -300,10 +312,12 @@ impl Transaction {
             snapshot.release();
         }
 
+        debug!(commit_ts, "transaction committed");
         Ok(commit_ts)
     }
 
     pub fn rollback(&mut self) {
+        debug!(write_count = self.writes.len(), "rollback transaction");
         self.writes.clear();
         self.closed = true;
         if let Some(mut snapshot) = self.snapshot.take() {

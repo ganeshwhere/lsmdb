@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::time::Instant;
 
+use lsmdb::observability::init_tracing_from_env;
 use lsmdb::server::{
     QueryPayload, RequestFrame, RequestType, ResponseFrame, ResponsePayload, TransactionState,
     read_response, write_request,
@@ -11,6 +12,10 @@ use tokio::net::TcpStream;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Err(err) = init_tracing_from_env() {
+        eprintln!("warning: failed to initialize tracing: {err}");
+    }
+
     let addr = parse_addr()?;
     let mut stream = TcpStream::connect(addr).await?;
 

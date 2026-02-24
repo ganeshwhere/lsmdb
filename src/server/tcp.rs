@@ -1,10 +1,12 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::catalog::Catalog;
 use crate::executor::{ExecutionError, ExecutionSession};
@@ -17,6 +19,8 @@ use super::protocol::{
     ProtocolError, RequestFrame, RequestType, ResponseFrame, ResponsePayload,
     payload_from_execution_result, read_request, write_response,
 };
+
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Error)]
 pub enum ServerError {
@@ -74,8 +78,10 @@ pub async fn start_server(
     catalog: Arc<Catalog>,
     store: Arc<MvccStore>,
 ) -> Result<ServerHandle, ServerError> {
+    info!(%bind_addr, "starting tcp server");
     let listener = TcpListener::bind(bind_addr).await?;
     let local_addr = listener.local_addr()?;
+    info!(%local_addr, "tcp server bound");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let task =
@@ -93,17 +99,21 @@ async fn run_accept_loop(
     loop {
         tokio::select! {
             _ = &mut shutdown_rx => {
+                info!("tcp accept loop received shutdown signal");
                 break;
             }
             accept_result = listener.accept() => {
-                let (stream, _) = accept_result?;
+                let (stream, peer_addr) = accept_result?;
+                let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+                info!(connection_id, %peer_addr, "accepted tcp connection");
                 let catalog = Arc::clone(&catalog);
                 let store = Arc::clone(&store);
+                let span = info_span!("connection", connection_id, %peer_addr);
                 tokio::spawn(async move {
                     if let Err(err) = handle_connection(stream, catalog, store).await {
-                        eprintln!("connection error: {err}");
+                        warn!(error = %err, "connection task failed");
                     }
-                });
+                }.instrument(span));
             }
         }
     }
@@ -117,18 +127,33 @@ async fn handle_connection(
     store: Arc<MvccStore>,
 ) -> Result<(), ServerError> {
     let mut session = ExecutionSession::new(catalog.as_ref(), store.as_ref());
+    debug!("connection session created");
 
     loop {
         let Some(request) = read_request(&mut stream).await? else {
+            debug!("client closed connection");
             return Ok(());
         };
 
+        let request_type = request.request_type;
+        let sql_len = request.sql.len();
+        debug!(request_type = ?request_type, sql_len, "received request frame");
+
         let response = match execute_request(&mut session, &catalog, request) {
-            Ok(payload) => ResponseFrame::Ok(payload),
-            Err(err) => ResponseFrame::Err(err.to_string()),
+            Ok(payload) => {
+                debug!(request_type = ?request_type, "request handled successfully");
+                ResponseFrame::Ok(payload)
+            }
+            Err(err) => {
+                warn!(request_type = ?request_type, error = %err, "request failed");
+                ResponseFrame::Err(err.to_string())
+            }
         };
 
-        write_response(&mut stream, &response).await?;
+        if let Err(err) = write_response(&mut stream, &response).await {
+            error!(error = %err, "failed to write response");
+            return Err(ServerError::Protocol(err));
+        }
     }
 }
 
@@ -137,6 +162,7 @@ fn execute_request(
     catalog: &Catalog,
     request: RequestFrame,
 ) -> Result<super::protocol::ResponsePayload, RequestError> {
+    debug!(request_type = ?request.request_type, "executing request");
     match request.request_type {
         RequestType::Query => {
             if request.sql.trim().is_empty() {
