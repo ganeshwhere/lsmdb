@@ -76,3 +76,93 @@ fn concurrent_create_table_allows_only_one_winner() {
     assert_eq!(successes, 1);
     assert_eq!(already_exists, 1);
 }
+
+#[test]
+fn concurrent_drop_table_allows_only_one_winner() {
+    let store = MvccStore::new();
+    let catalog = Catalog::open(store.clone()).expect("open catalog");
+    catalog.create_table(users_table()).expect("seed users table");
+
+    let barrier = Arc::new(Barrier::new(3));
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let store = store.clone();
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            let catalog = Catalog::open(store).expect("open catalog");
+            barrier.wait();
+            catalog.drop_table("users")
+        }));
+    }
+
+    barrier.wait();
+
+    let mut successes = 0;
+    let mut not_found = 0;
+    for handle in handles {
+        match handle.join().expect("worker should not panic") {
+            Ok(()) => successes += 1,
+            Err(CatalogError::TableNotFound(name)) => {
+                assert_eq!(name, "users");
+                not_found += 1;
+            }
+            Err(other) => panic!("unexpected catalog error: {other}"),
+        }
+    }
+
+    assert_eq!(successes, 1);
+    assert_eq!(not_found, 1);
+
+    let reopened = Catalog::open(store).expect("reopen catalog");
+    assert!(reopened.get_table("users").is_none());
+}
+
+#[test]
+fn concurrent_drop_and_create_table_produces_consistent_final_state() {
+    let store = MvccStore::new();
+    let catalog = Catalog::open(store.clone()).expect("open catalog");
+    catalog.create_table(users_table()).expect("seed users table");
+
+    let barrier = Arc::new(Barrier::new(3));
+
+    let drop_handle = {
+        let store = store.clone();
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+            let catalog = Catalog::open(store).expect("open catalog for drop");
+            barrier.wait();
+            catalog.drop_table("users")
+        })
+    };
+
+    let create_handle = {
+        let store = store.clone();
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+            let catalog = Catalog::open(store).expect("open catalog for create");
+            barrier.wait();
+            catalog.create_table(users_table())
+        })
+    };
+
+    barrier.wait();
+
+    let drop_result = drop_handle.join().expect("drop worker should not panic");
+    let create_result = create_handle.join().expect("create worker should not panic");
+
+    assert!(drop_result.is_ok(), "drop should always succeed in this race");
+    let create_succeeded = match create_result {
+        Ok(()) => true,
+        Err(CatalogError::TableAlreadyExists(_)) => false,
+        Err(other) => panic!("unexpected catalog create result: {other}"),
+    };
+
+    let reopened = Catalog::open(store).expect("reopen catalog");
+    let exists = reopened.get_table("users").is_some();
+
+    if create_succeeded {
+        assert!(exists, "successful concurrent create must persist table");
+    } else {
+        assert!(!exists, "already-exists response means create did not re-add table");
+    }
+}
