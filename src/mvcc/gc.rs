@@ -1,6 +1,6 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -55,14 +55,16 @@ impl GcWorker {
 
         let handle = thread::Builder::new()
             .name("lsmdb-mvcc-gc".to_string())
-            .spawn(move || loop {
-                match shutdown_rx.recv_timeout(config.interval) {
-                    Ok(_) => break,
-                    Err(RecvTimeoutError::Disconnected) => break,
-                    Err(RecvTimeoutError::Timeout) => {
-                        let stats = run_gc_once(&store);
-                        last_removed_versions_worker
-                            .store(stats.removed_versions, Ordering::Release);
+            .spawn(move || {
+                loop {
+                    match shutdown_rx.recv_timeout(config.interval) {
+                        Ok(_) => break,
+                        Err(RecvTimeoutError::Disconnected) => break,
+                        Err(RecvTimeoutError::Timeout) => {
+                            let stats = run_gc_once(&store);
+                            last_removed_versions_worker
+                                .store(stats.removed_versions, Ordering::Release);
+                        }
                     }
                 }
             })

@@ -1236,9 +1236,7 @@ fn compact_one_task(task: CompactionTask) -> CompactionResponse {
     }
 }
 
-fn merge_compaction_rows(
-    mut rows: Vec<(Vec<u8>, Vec<u8>, u64)>,
-) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn merge_compaction_rows(mut rows: Vec<(Vec<u8>, Vec<u8>, u64)>) -> Vec<(Vec<u8>, Vec<u8>)> {
     rows.sort_by(|left, right| left.0.cmp(&right.0).then(left.2.cmp(&right.2)));
 
     // First collapse identical internal keys, preferring the newest table id.
@@ -1293,9 +1291,7 @@ fn merge_compaction_rows(
     collapsed
 }
 
-fn estimate_live_user_bytes_for_tables(
-    tables: &[SSTableRuntime],
-) -> Result<u64, SSTableReadError> {
+fn estimate_live_user_bytes_for_tables(tables: &[SSTableRuntime]) -> Result<u64, SSTableReadError> {
     let mut latest = HashMap::<Vec<u8>, (u64, ValueType, u64)>::new();
     let mut undecodable_live_bytes = 0_u64;
 
@@ -1313,13 +1309,11 @@ fn estimate_live_user_bytes_for_tables(
 
     let decoded_live_bytes = latest
         .values()
-        .map(|(_, value_type, logical_bytes)| {
-            if *value_type == ValueType::Put {
-                *logical_bytes
-            } else {
-                0
-            }
-        })
+        .map(
+            |(_, value_type, logical_bytes)| {
+                if *value_type == ValueType::Put { *logical_bytes } else { 0 }
+            },
+        )
         .sum::<u64>();
 
     Ok(decoded_live_bytes.saturating_add(undecodable_live_bytes))
@@ -1343,7 +1337,10 @@ fn accumulate_live_user_bytes(
         .map(|(sequence, _, _)| decoded.sequence > *sequence)
         .unwrap_or(true);
     if should_replace {
-        latest.insert(decoded.user_key.to_vec(), (decoded.sequence, decoded.value_type, logical_bytes));
+        latest.insert(
+            decoded.user_key.to_vec(),
+            (decoded.sequence, decoded.value_type, logical_bytes),
+        );
     }
 }
 
@@ -1515,7 +1512,9 @@ mod tests {
         let merged = merge_compaction_rows(rows);
         let dup_row = merged
             .iter()
-            .find(|(key, _)| decode_internal_key(key).map(|k| k.user_key == b"dup").unwrap_or(false))
+            .find(|(key, _)| {
+                decode_internal_key(key).map(|k| k.user_key == b"dup").unwrap_or(false)
+            })
             .expect("duplicate key row");
         assert_eq!(dup_row.1, b"new".to_vec());
     }
@@ -1546,13 +1545,11 @@ mod tests {
 
         let live = latest
             .values()
-            .map(|(_, value_type, logical_bytes)| {
-                if *value_type == ValueType::Put {
-                    *logical_bytes
-                } else {
-                    0
-                }
-            })
+            .map(
+                |(_, value_type, logical_bytes)| {
+                    if *value_type == ValueType::Put { *logical_bytes } else { 0 }
+                },
+            )
             .sum::<u64>()
             .saturating_add(undecodable);
 

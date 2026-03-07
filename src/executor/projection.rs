@@ -102,9 +102,9 @@ fn compare_sort_keys(
 
 fn compare_scalar_for_sort(left: &ScalarValue, right: &ScalarValue) -> Ordering {
     match (left, right) {
-        (ScalarValue::Null, ScalarValue::Null) => Ordering::Equal,
-        (ScalarValue::Null, _) => Ordering::Greater,
-        (_, ScalarValue::Null) => Ordering::Less,
+        (ScalarValue::Null, ScalarValue::Null) => return Ordering::Equal,
+        (ScalarValue::Null, _) => return Ordering::Greater,
+        (_, ScalarValue::Null) => return Ordering::Less,
         _ => {}
     }
 

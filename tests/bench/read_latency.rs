@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use hdrhistogram::Histogram;
 use lsmdb::storage::engine::{StorageEngine, StorageEngineOptions};
 use lsmdb::storage::wal::SyncMode;

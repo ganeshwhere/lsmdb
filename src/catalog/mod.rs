@@ -27,8 +27,8 @@ pub enum CatalogError {
     Transaction(#[from] TransactionError),
     #[error("failed to serialize table descriptor: {0}")]
     Serialization(String),
-    #[error("failed to deserialize table descriptor at key '{key}': {source}")]
-    Deserialization { key: String, source: String },
+    #[error("failed to deserialize table descriptor at key '{key}': {message}")]
+    Deserialization { key: String, message: String },
 }
 
 #[derive(Debug)]
@@ -55,7 +55,7 @@ impl Catalog {
         let table_name = normalize_table_name(&descriptor.name)?.to_string();
         descriptor.name = table_name.clone();
         descriptor.validate()?;
-        let key = table_storage_key(table_name);
+        let key = table_storage_key(&table_name);
         let payload = bincode::serialize(&descriptor)
             .map_err(|err| CatalogError::Serialization(err.to_string()))?;
 
@@ -72,7 +72,7 @@ impl Catalog {
             }
             Err(err @ TransactionError::WriteWriteConflict { .. }) => {
                 self.refresh()?;
-                if self.tables.read().contains_key(table_name) {
+                if self.tables.read().contains_key(&table_name) {
                     return Err(CatalogError::TableAlreadyExists(table_name.to_string()));
                 }
                 Err(CatalogError::Transaction(err))
@@ -127,19 +127,19 @@ impl Catalog {
             let table_name = table_name_from_key(&key)
                 .ok_or_else(|| CatalogError::Deserialization {
                     key: key_string.clone(),
-                    source: "table key does not use catalog table prefix".to_string(),
+                    message: "table key does not use catalog table prefix".to_string(),
                 })?
                 .to_string();
 
             let descriptor: TableDescriptor = bincode::deserialize(&payload).map_err(|err| {
-                CatalogError::Deserialization { key: key_string.clone(), source: err.to_string() }
+                CatalogError::Deserialization { key: key_string.clone(), message: err.to_string() }
             })?;
 
             descriptor.validate()?;
             if descriptor.name != table_name {
                 return Err(CatalogError::Deserialization {
                     key: key_string,
-                    source: format!(
+                    message: format!(
                         "descriptor name '{}' does not match key table '{}'",
                         descriptor.name, table_name
                     ),

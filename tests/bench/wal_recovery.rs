@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lsmdb::storage::wal::{
-    SyncMode, WalReader, WalWriter, WalWriterOptions,
-    DEFAULT_SEGMENT_SIZE_BYTES as WAL_DEFAULT_SEGMENT_SIZE_BYTES,
+    DEFAULT_SEGMENT_SIZE_BYTES as WAL_DEFAULT_SEGMENT_SIZE_BYTES, SyncMode, WalReader, WalWriter,
+    WalWriterOptions,
 };
 
 const DEFAULT_RECORDS: usize = 250_000;

@@ -1,6 +1,6 @@
 use crate::sql::ast::{BinaryOp, Expr, UnaryOp};
 
-use super::{literal_to_scalar, scalar_type_name, ExecutionError, Row, RowSet, ScalarValue};
+use super::{ExecutionError, Row, RowSet, ScalarValue, literal_to_scalar, scalar_type_name};
 
 pub(crate) fn apply_filter(input: RowSet, predicate: &Expr) -> Result<RowSet, ExecutionError> {
     let RowSet { columns, rows, table_name } = input;
