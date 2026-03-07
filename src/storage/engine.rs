@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -357,7 +357,7 @@ impl StorageEngine {
 
         {
             let mut state = engine.state.lock();
-            engine.refresh_compaction_space_metrics_locked(&state);
+            engine.refresh_compaction_space_metrics_locked(&state)?;
             engine.schedule_pending_flushes_locked(&mut state)?;
             engine.schedule_pending_compactions_locked(&mut state)?;
         }
@@ -389,7 +389,6 @@ impl StorageEngine {
         state.memtables.put(key, sequence, value);
         self.schedule_pending_flushes_locked(&mut state)?;
         self.schedule_pending_compactions_locked(&mut state)?;
-        self.refresh_compaction_space_metrics_locked(&state);
         self.metrics.puts.fetch_add(1, Ordering::Relaxed);
         self.metrics
             .compaction
@@ -416,7 +415,6 @@ impl StorageEngine {
         state.memtables.delete(key, sequence);
         self.schedule_pending_flushes_locked(&mut state)?;
         self.schedule_pending_compactions_locked(&mut state)?;
-        self.refresh_compaction_space_metrics_locked(&state);
         self.metrics.deletes.fetch_add(1, Ordering::Relaxed);
         self.metrics.compaction.lock().record_user_write(key.len() as u64);
 
@@ -847,7 +845,7 @@ impl StorageEngine {
                 state.memtables.remove_immutable(&completed.memtable);
                 state.sstables.insert(0, SSTableRuntime { metadata, reader });
                 self.metrics.flushes_completed.fetch_add(1, Ordering::Relaxed);
-                self.refresh_compaction_space_metrics_locked(&state);
+                self.refresh_compaction_space_metrics_locked(&state)?;
                 self.schedule_pending_compactions_locked(&mut state)?;
             }
             FlushResponse::Empty { memtable } => {
@@ -933,7 +931,7 @@ impl StorageEngine {
                         completed.task_id,
                         &completed.input_tables,
                     );
-                    self.refresh_compaction_space_metrics_locked(&state);
+                    self.refresh_compaction_space_metrics_locked(&state)?;
                     self.schedule_pending_compactions_locked(&mut state)?;
                     removed_file_names
                 };
@@ -982,7 +980,7 @@ impl StorageEngine {
                         .sstables
                         .retain(|runtime| !input_ids.contains(&runtime.metadata.table_id));
                     self.release_compaction_task_locked(&mut state, task_id, &input_tables);
-                    self.refresh_compaction_space_metrics_locked(&state);
+                    self.refresh_compaction_space_metrics_locked(&state)?;
                     self.schedule_pending_compactions_locked(&mut state)?;
                 }
 
@@ -1008,10 +1006,15 @@ impl StorageEngine {
         Ok(())
     }
 
-    fn refresh_compaction_space_metrics_locked(&self, state: &EngineState) {
+    fn refresh_compaction_space_metrics_locked(
+        &self,
+        state: &EngineState,
+    ) -> Result<(), EngineError> {
         let total_bytes =
             state.sstables.iter().map(|runtime| runtime.metadata.file_size_bytes).sum::<u64>();
-        self.metrics.compaction.lock().set_space_bytes(total_bytes, total_bytes);
+        let live_bytes = estimate_live_user_bytes_for_tables(&state.sstables)?;
+        self.metrics.compaction.lock().set_space_bytes(live_bytes, total_bytes);
+        Ok(())
     }
 
     fn release_compaction_task(&self, task_id: u64, input_tables: &[SSTableMetadata]) {
@@ -1290,6 +1293,60 @@ fn merge_compaction_rows(
     collapsed
 }
 
+fn estimate_live_user_bytes_for_tables(
+    tables: &[SSTableRuntime],
+) -> Result<u64, SSTableReadError> {
+    let mut latest = HashMap::<Vec<u8>, (u64, ValueType, u64)>::new();
+    let mut undecodable_live_bytes = 0_u64;
+
+    for table in tables {
+        let rows = table.reader.scan_range(None, None)?;
+        for (internal_key, value) in rows {
+            accumulate_live_user_bytes(
+                &mut latest,
+                &internal_key,
+                value.len(),
+                &mut undecodable_live_bytes,
+            );
+        }
+    }
+
+    let decoded_live_bytes = latest
+        .values()
+        .map(|(_, value_type, logical_bytes)| {
+            if *value_type == ValueType::Put {
+                *logical_bytes
+            } else {
+                0
+            }
+        })
+        .sum::<u64>();
+
+    Ok(decoded_live_bytes.saturating_add(undecodable_live_bytes))
+}
+
+fn accumulate_live_user_bytes(
+    latest: &mut HashMap<Vec<u8>, (u64, ValueType, u64)>,
+    internal_key: &[u8],
+    value_len: usize,
+    undecodable_live_bytes: &mut u64,
+) {
+    let Some(decoded) = decode_internal_key(internal_key) else {
+        *undecodable_live_bytes = undecodable_live_bytes
+            .saturating_add((internal_key.len().saturating_add(value_len)) as u64);
+        return;
+    };
+
+    let logical_bytes = (decoded.user_key.len().saturating_add(value_len)) as u64;
+    let should_replace = latest
+        .get(decoded.user_key)
+        .map(|(sequence, _, _)| decoded.sequence > *sequence)
+        .unwrap_or(true);
+    if should_replace {
+        latest.insert(decoded.user_key.to_vec(), (decoded.sequence, decoded.value_type, logical_bytes));
+    }
+}
+
 fn recover_from_wal(
     wal_dir: &Path,
     memtables: &mut MemTableManager,
@@ -1461,5 +1518,56 @@ mod tests {
             .find(|(key, _)| decode_internal_key(key).map(|k| k.user_key == b"dup").unwrap_or(false))
             .expect("duplicate key row");
         assert_eq!(dup_row.1, b"new".to_vec());
+    }
+
+    #[test]
+    fn live_user_bytes_prefers_latest_sequence_and_ignores_tombstone_payload() {
+        let mut latest = HashMap::<Vec<u8>, (u64, ValueType, u64)>::new();
+        let mut undecodable = 0_u64;
+
+        accumulate_live_user_bytes(
+            &mut latest,
+            &encode_internal_key(b"user:1", 1, ValueType::Put),
+            5,
+            &mut undecodable,
+        );
+        accumulate_live_user_bytes(
+            &mut latest,
+            &encode_internal_key(b"user:1", 2, ValueType::Delete),
+            0,
+            &mut undecodable,
+        );
+        accumulate_live_user_bytes(
+            &mut latest,
+            &encode_internal_key(b"user:2", 3, ValueType::Put),
+            4,
+            &mut undecodable,
+        );
+
+        let live = latest
+            .values()
+            .map(|(_, value_type, logical_bytes)| {
+                if *value_type == ValueType::Put {
+                    *logical_bytes
+                } else {
+                    0
+                }
+            })
+            .sum::<u64>()
+            .saturating_add(undecodable);
+
+        // user:1 latest is delete => 0 live bytes for that key.
+        // user:2 latest is put with logical bytes = len("user:2") + value_len(4) = 10.
+        assert_eq!(live, 10);
+    }
+
+    #[test]
+    fn live_user_bytes_counts_undecodable_keys_as_live() {
+        let mut latest = HashMap::<Vec<u8>, (u64, ValueType, u64)>::new();
+        let mut undecodable = 0_u64;
+
+        accumulate_live_user_bytes(&mut latest, b"\x01\x02\x03", 7, &mut undecodable);
+        assert_eq!(undecodable, 10);
+        assert!(latest.is_empty());
     }
 }

@@ -59,6 +59,11 @@ fn engine_runs_background_compaction_and_preserves_reads() {
             compaction_metrics.completed_compactions >= 1,
             "expected at least one completed compaction, got {compaction_metrics:?}"
         );
+        assert!(compaction_metrics.total_bytes_on_disk > 0);
+        assert!(
+            compaction_metrics.live_bytes <= compaction_metrics.total_bytes_on_disk,
+            "live bytes should not exceed total bytes: {compaction_metrics:?}"
+        );
 
         for sample in [0_u32, 37, 83, 119] {
             let key = format!("k{sample:04}");
@@ -125,6 +130,13 @@ fn compaction_collapses_old_versions_for_same_user_key() {
         assert_eq!(
             hot_versions, 1,
             "expected one compacted version for hot-key, found {hot_versions}"
+        );
+
+        let metrics = engine.compaction_metrics();
+        assert!(metrics.total_bytes_on_disk > 0);
+        assert!(
+            metrics.live_bytes < metrics.total_bytes_on_disk,
+            "expected compaction to reduce live/total ratio below 1.0, got {metrics:?}"
         );
     }
 
