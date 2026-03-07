@@ -307,6 +307,7 @@ impl LsmdbConfig {
                 bloom_bits_per_key: bits_per_key,
                 bloom_hash_functions: hash_functions,
             },
+            compaction_strategy: self.to_compaction_strategy_unchecked(),
             flush_poll_interval: Duration::from_millis(self.storage.flush_poll_interval_ms),
             flush_timeout: Duration::from_millis(self.storage.flush_timeout_ms),
         }

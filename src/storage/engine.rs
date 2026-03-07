@@ -11,8 +11,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, info, trace, warn};
 
-use super::compaction::CompactionMetrics;
-use super::manifest::version::SSTableMetadata;
+use super::compaction::{
+    CompactionMetrics, CompactionPlan, CompactionScheduler, CompactionStrategy,
+    LeveledCompactionConfig, ScheduledCompaction,
+};
+use super::manifest::version::{SSTableMetadata, VersionSet};
 use super::manifest::{Manifest, ManifestError, VersionEdit};
 use super::memtable::{MemTable, MemTableManager, ValueType, decode_internal_key};
 use super::sstable::{
@@ -33,6 +36,7 @@ pub struct StorageEngineOptions {
     pub memtable_arena_block_size_bytes: usize,
     pub wal_options: WalWriterOptions,
     pub sstable_builder_options: SSTableBuilderOptions,
+    pub compaction_strategy: CompactionStrategy,
     pub flush_poll_interval: Duration,
     pub flush_timeout: Duration,
 }
@@ -44,6 +48,7 @@ impl Default for StorageEngineOptions {
             memtable_arena_block_size_bytes: super::memtable::arena::DEFAULT_ARENA_BLOCK_SIZE_BYTES,
             wal_options: WalWriterOptions::default(),
             sstable_builder_options: SSTableBuilderOptions::default(),
+            compaction_strategy: CompactionStrategy::Leveled(LeveledCompactionConfig::default()),
             flush_poll_interval: Duration::from_millis(10),
             flush_timeout: Duration::from_secs(5),
         }
@@ -70,6 +75,10 @@ pub enum EngineError {
     BackgroundFlush(String),
     #[error("background flush timed out after {0:?}")]
     FlushTimeout(Duration),
+    #[error("background compaction failed: {0}")]
+    BackgroundCompaction(String),
+    #[error("background compaction timed out after {0:?}")]
+    CompactionTimeout(Duration),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -134,6 +143,8 @@ struct EngineState {
     memtables: MemTableManager,
     pending_flush: HashSet<usize>,
     sstables: Vec<SSTableRuntime>,
+    compaction_scheduler: CompactionScheduler,
+    in_flight_compaction_tables: HashSet<u64>,
     next_sequence: u64,
     next_table_id: u64,
 }
@@ -166,6 +177,41 @@ enum FlushResponse {
     Flushed(FlushCompleted),
     Empty { memtable: Arc<MemTable> },
     Failed { memtable: Arc<MemTable>, error: String },
+}
+
+#[derive(Debug)]
+enum CompactionRequest {
+    Compact(CompactionTask),
+    Shutdown,
+}
+
+#[derive(Debug)]
+struct CompactionTask {
+    scheduled: ScheduledCompaction,
+    input_tables: Vec<SSTableMetadata>,
+    output_table_id: u64,
+    output_level: u32,
+    output_path: PathBuf,
+    sstable_dir: PathBuf,
+    options: SSTableBuilderOptions,
+}
+
+#[derive(Debug)]
+struct CompactionCompleted {
+    task_id: u64,
+    input_tables: Vec<SSTableMetadata>,
+    output_table_id: u64,
+    output_level: u32,
+    summary: SSTableBuildSummary,
+    smallest_key: Vec<u8>,
+    largest_key: Vec<u8>,
+}
+
+#[derive(Debug)]
+enum CompactionResponse {
+    Compacted(CompactionCompleted),
+    Empty { task_id: u64, input_tables: Vec<SSTableMetadata> },
+    Failed { task_id: u64, input_tables: Vec<SSTableMetadata>, error: String },
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -212,6 +258,9 @@ pub struct StorageEngine {
     flush_tx: Sender<FlushRequest>,
     flush_rx: Mutex<Receiver<FlushResponse>>,
     flush_thread: Mutex<Option<JoinHandle<()>>>,
+    compaction_tx: Sender<CompactionRequest>,
+    compaction_rx: Mutex<Receiver<CompactionResponse>>,
+    compaction_thread: Mutex<Option<JoinHandle<()>>>,
     shutdown_complete: AtomicBool,
 }
 
@@ -267,12 +316,18 @@ impl StorageEngine {
         let wal_writer = WalWriter::open_with_options(&wal_dir, options.wal_options)?;
 
         let (flush_tx, flush_rx_task) = mpsc::channel::<FlushRequest>();
-        let (result_tx, result_rx) = mpsc::channel::<FlushResponse>();
+        let (flush_result_tx, flush_result_rx) = mpsc::channel::<FlushResponse>();
+        let (compaction_tx, compaction_rx_task) = mpsc::channel::<CompactionRequest>();
+        let (compaction_result_tx, compaction_result_rx) = mpsc::channel::<CompactionResponse>();
 
         let flush_thread = thread::Builder::new()
             .name("lsmdb-flush".to_string())
-            .spawn(move || flush_worker_loop(flush_rx_task, result_tx))
+            .spawn(move || flush_worker_loop(flush_rx_task, flush_result_tx))
             .map_err(|err| EngineError::BackgroundFlush(err.to_string()))?;
+        let compaction_thread = thread::Builder::new()
+            .name("lsmdb-compaction".to_string())
+            .spawn(move || compaction_worker_loop(compaction_rx_task, compaction_result_tx))
+            .map_err(|err| EngineError::BackgroundCompaction(err.to_string()))?;
 
         let engine = Self {
             root_dir,
@@ -285,22 +340,29 @@ impl StorageEngine {
                 memtables,
                 pending_flush: HashSet::new(),
                 sstables: sstable_runtimes,
+                compaction_scheduler: CompactionScheduler::default(),
+                in_flight_compaction_tables: HashSet::new(),
                 next_sequence: recovered_max_sequence,
                 next_table_id,
             }),
             metrics: EngineMetricsState::from_replay(replay_stats),
             flush_tx,
-            flush_rx: Mutex::new(result_rx),
+            flush_rx: Mutex::new(flush_result_rx),
             flush_thread: Mutex::new(Some(flush_thread)),
+            compaction_tx,
+            compaction_rx: Mutex::new(compaction_result_rx),
+            compaction_thread: Mutex::new(Some(compaction_thread)),
             shutdown_complete: AtomicBool::new(false),
         };
 
         {
             let mut state = engine.state.lock();
+            engine.refresh_compaction_space_metrics_locked(&state);
             engine.schedule_pending_flushes_locked(&mut state)?;
+            engine.schedule_pending_compactions_locked(&mut state)?;
         }
 
-        engine.drain_flush_results()?;
+        engine.drain_background_results()?;
         info!(
             sstable_count = engine.sstable_count(),
             immutable_memtables = engine.immutable_memtable_count(),
@@ -311,7 +373,7 @@ impl StorageEngine {
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<u64, EngineError> {
-        self.drain_flush_results()?;
+        self.drain_background_results()?;
 
         let sequence = {
             let mut state = self.state.lock();
@@ -326,13 +388,19 @@ impl StorageEngine {
         let mut state = self.state.lock();
         state.memtables.put(key, sequence, value);
         self.schedule_pending_flushes_locked(&mut state)?;
+        self.schedule_pending_compactions_locked(&mut state)?;
+        self.refresh_compaction_space_metrics_locked(&state);
         self.metrics.puts.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .compaction
+            .lock()
+            .record_user_write((key.len().saturating_add(value.len())) as u64);
 
         Ok(sequence)
     }
 
     pub fn delete(&self, key: &[u8]) -> Result<u64, EngineError> {
-        self.drain_flush_results()?;
+        self.drain_background_results()?;
 
         let sequence = {
             let mut state = self.state.lock();
@@ -347,13 +415,16 @@ impl StorageEngine {
         let mut state = self.state.lock();
         state.memtables.delete(key, sequence);
         self.schedule_pending_flushes_locked(&mut state)?;
+        self.schedule_pending_compactions_locked(&mut state)?;
+        self.refresh_compaction_space_metrics_locked(&state);
         self.metrics.deletes.fetch_add(1, Ordering::Relaxed);
+        self.metrics.compaction.lock().record_user_write(key.len() as u64);
 
         Ok(sequence)
     }
 
     pub fn get(&self, user_key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
-        self.drain_flush_results()?;
+        self.drain_background_results()?;
         self.metrics.gets.fetch_add(1, Ordering::Relaxed);
         trace!(key_len = user_key.len(), "read request");
 
@@ -368,26 +439,38 @@ impl StorageEngine {
         };
 
         if let Some(version) = resolve_from_memtable(&mutable, user_key) {
+            self.metrics.compaction.lock().record_point_lookup(0);
             return Ok(version.as_user_value());
         }
 
         for table in immutables.iter().rev() {
             if let Some(version) = resolve_from_memtable(table, user_key) {
+                self.metrics.compaction.lock().record_point_lookup(0);
                 return Ok(version.as_user_value());
             }
         }
 
+        let mut files_checked = 0_u64;
+        let mut latest: Option<ResolvedVersion> = None;
         for reader in &sstable_readers {
-            if let Some(version) = resolve_from_sstable(reader, user_key)? {
-                return Ok(version.as_user_value());
+            files_checked = files_checked.saturating_add(1);
+            if let Some(candidate) = resolve_from_sstable(reader, user_key)? {
+                let should_replace = latest
+                    .as_ref()
+                    .map(|current| candidate.sequence > current.sequence)
+                    .unwrap_or(true);
+                if should_replace {
+                    latest = Some(candidate);
+                }
             }
         }
+        self.metrics.compaction.lock().record_point_lookup(files_checked);
 
-        Ok(None)
+        Ok(latest.map(ResolvedVersion::as_user_value).unwrap_or(None))
     }
 
     pub fn force_flush(&self) -> Result<(), EngineError> {
-        self.drain_flush_results()?;
+        self.drain_background_results()?;
         info!("force flush requested");
 
         {
@@ -396,6 +479,7 @@ impl StorageEngine {
                 state.memtables.promote_mutable();
             }
             self.schedule_pending_flushes_locked(&mut state)?;
+            self.schedule_pending_compactions_locked(&mut state)?;
         }
 
         self.wait_for_background_flush(self.options.flush_timeout)
@@ -405,7 +489,7 @@ impl StorageEngine {
         let deadline = Instant::now() + timeout;
 
         loop {
-            self.drain_flush_results()?;
+            self.drain_background_results()?;
 
             let pending = self.state.lock().pending_flush.len();
             if pending == 0 {
@@ -415,6 +499,32 @@ impl StorageEngine {
 
             if Instant::now() >= deadline {
                 return Err(EngineError::FlushTimeout(timeout));
+            }
+
+            thread::sleep(self.options.flush_poll_interval);
+        }
+    }
+
+    pub fn wait_for_background_compaction(&self, timeout: Duration) -> Result<(), EngineError> {
+        let deadline = Instant::now() + timeout;
+
+        loop {
+            self.drain_background_results()?;
+
+            let (pending, in_flight) = {
+                let state = self.state.lock();
+                (
+                    state.compaction_scheduler.pending_count(),
+                    state.compaction_scheduler.in_flight_count(),
+                )
+            };
+            if pending == 0 && in_flight == 0 {
+                debug!("background compaction drained");
+                return Ok(());
+            }
+
+            if Instant::now() >= deadline {
+                return Err(EngineError::CompactionTimeout(timeout));
             }
 
             thread::sleep(self.options.flush_poll_interval);
@@ -502,6 +612,10 @@ impl StorageEngine {
             self.shutdown_complete.store(false, Ordering::Release);
             return Err(err);
         }
+        if let Err(err) = self.wait_for_background_compaction(self.options.flush_timeout) {
+            self.shutdown_complete.store(false, Ordering::Release);
+            return Err(err);
+        }
 
         {
             let mut writer = self.wal_writer.lock();
@@ -519,6 +633,7 @@ impl StorageEngine {
             }
         }
 
+        self.stop_compaction_worker()?;
         self.stop_flush_worker()?;
         info!("graceful storage engine shutdown complete");
         Ok(())
@@ -563,6 +678,83 @@ impl StorageEngine {
         Ok(())
     }
 
+    fn schedule_pending_compactions_locked(
+        &self,
+        state: &mut EngineState,
+    ) -> Result<(), EngineError> {
+        loop {
+            let versions = build_schedulable_version_set(state);
+            let Some(_) = state
+                .compaction_scheduler
+                .schedule_from_versions(&versions, &self.options.compaction_strategy)
+            else {
+                break;
+            };
+            let Some(scheduled) = state.compaction_scheduler.pop_next() else {
+                break;
+            };
+
+            let input_tables = compaction_plan_inputs(&scheduled.plan);
+            if input_tables.is_empty() {
+                state.compaction_scheduler.mark_completed(scheduled.task_id);
+                continue;
+            }
+            if input_tables
+                .iter()
+                .any(|table| state.in_flight_compaction_tables.contains(&table.table_id))
+            {
+                state.compaction_scheduler.mark_completed(scheduled.task_id);
+                continue;
+            }
+            let inputs_present = input_tables.iter().all(|table| {
+                state.sstables.iter().any(|runtime| {
+                    runtime.metadata.table_id == table.table_id
+                        && runtime.metadata.level == table.level
+                })
+            });
+            if !inputs_present {
+                state.compaction_scheduler.mark_completed(scheduled.task_id);
+                continue;
+            }
+
+            let output_table_id = state.next_table_id;
+            state.next_table_id = state.next_table_id.saturating_add(1);
+            let output_level = compaction_plan_output_level(&scheduled.plan);
+            let task_id = scheduled.task_id;
+
+            let task = CompactionTask {
+                scheduled,
+                input_tables: input_tables.clone(),
+                output_table_id,
+                output_level,
+                output_path: self.sstable_dir.join(sstable_file_name(output_table_id)),
+                sstable_dir: self.sstable_dir.clone(),
+                options: self.options.sstable_builder_options,
+            };
+
+            self.compaction_tx.send(CompactionRequest::Compact(task)).map_err(|_| {
+                EngineError::BackgroundCompaction("compaction worker channel is closed".to_string())
+            })?;
+            for table in &input_tables {
+                state.in_flight_compaction_tables.insert(table.table_id);
+            }
+            debug!(
+                task_id,
+                output_level,
+                input_count = input_tables.len(),
+                "scheduled compaction task"
+            );
+        }
+
+        Ok(())
+    }
+
+    fn drain_background_results(&self) -> Result<(), EngineError> {
+        self.drain_flush_results()?;
+        self.drain_compaction_results()?;
+        Ok(())
+    }
+
     fn drain_flush_results(&self) -> Result<(), EngineError> {
         let mut completed = Vec::new();
 
@@ -583,6 +775,31 @@ impl StorageEngine {
 
         for message in completed {
             self.apply_flush_result(message)?;
+        }
+
+        Ok(())
+    }
+
+    fn drain_compaction_results(&self) -> Result<(), EngineError> {
+        let mut completed = Vec::new();
+
+        {
+            let rx = self.compaction_rx.lock();
+            loop {
+                match rx.try_recv() {
+                    Ok(message) => completed.push(message),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        return Err(EngineError::BackgroundCompaction(
+                            "compaction worker disconnected unexpectedly".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        for message in completed {
+            self.apply_compaction_result(message)?;
         }
 
         Ok(())
@@ -630,6 +847,8 @@ impl StorageEngine {
                 state.memtables.remove_immutable(&completed.memtable);
                 state.sstables.insert(0, SSTableRuntime { metadata, reader });
                 self.metrics.flushes_completed.fetch_add(1, Ordering::Relaxed);
+                self.refresh_compaction_space_metrics_locked(&state);
+                self.schedule_pending_compactions_locked(&mut state)?;
             }
             FlushResponse::Empty { memtable } => {
                 let marker = Arc::as_ptr(&memtable) as usize;
@@ -638,6 +857,7 @@ impl StorageEngine {
                 state.memtables.remove_immutable(&memtable);
                 debug!("dropped empty immutable memtable");
                 self.metrics.flushes_empty.fetch_add(1, Ordering::Relaxed);
+                self.schedule_pending_compactions_locked(&mut state)?;
             }
             FlushResponse::Failed { memtable, error } => {
                 let marker = Arc::as_ptr(&memtable) as usize;
@@ -646,6 +866,187 @@ impl StorageEngine {
                 self.metrics.flushes_failed.fetch_add(1, Ordering::Relaxed);
                 return Err(EngineError::BackgroundFlush(error));
             }
+        }
+
+        Ok(())
+    }
+
+    fn apply_compaction_result(&self, message: CompactionResponse) -> Result<(), EngineError> {
+        match message {
+            CompactionResponse::Compacted(completed) => {
+                let file_name = completed
+                    .summary
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| {
+                        EngineError::BackgroundCompaction(
+                            "compacted SSTable path has no file name".to_string(),
+                        )
+                    })?
+                    .to_string();
+                let metadata = SSTableMetadata {
+                    table_id: completed.output_table_id,
+                    level: completed.output_level,
+                    file_name,
+                    smallest_key: completed.smallest_key,
+                    largest_key: completed.largest_key,
+                    file_size_bytes: completed.summary.file_size_bytes,
+                };
+                let reader = Arc::new(SSTableReader::open(&completed.summary.path)?);
+
+                let manifest_result = (|| -> Result<(), EngineError> {
+                    let mut manifest = self.manifest.lock();
+                    manifest.apply_edit(VersionEdit::AddTable(metadata.clone()))?;
+                    for table in &completed.input_tables {
+                        manifest.apply_edit(VersionEdit::RemoveTable {
+                            level: table.level,
+                            table_id: table.table_id,
+                        })?;
+                    }
+                    Ok(())
+                })();
+                if let Err(err) = manifest_result {
+                    self.release_compaction_task(completed.task_id, &completed.input_tables);
+                    return Err(err);
+                }
+
+                let removed_file_names = {
+                    let input_ids = completed
+                        .input_tables
+                        .iter()
+                        .map(|table| table.table_id)
+                        .collect::<HashSet<_>>();
+                    let mut state = self.state.lock();
+                    let removed_file_names = state
+                        .sstables
+                        .iter()
+                        .filter(|runtime| input_ids.contains(&runtime.metadata.table_id))
+                        .map(|runtime| runtime.metadata.file_name.clone())
+                        .collect::<Vec<_>>();
+                    state
+                        .sstables
+                        .retain(|runtime| !input_ids.contains(&runtime.metadata.table_id));
+                    state.sstables.insert(0, SSTableRuntime { metadata: metadata.clone(), reader });
+                    self.release_compaction_task_locked(
+                        &mut state,
+                        completed.task_id,
+                        &completed.input_tables,
+                    );
+                    self.refresh_compaction_space_metrics_locked(&state);
+                    self.schedule_pending_compactions_locked(&mut state)?;
+                    removed_file_names
+                };
+
+                for file_name in removed_file_names {
+                    let path = self.sstable_dir.join(file_name);
+                    if let Err(err) = std::fs::remove_file(&path) {
+                        if err.kind() != std::io::ErrorKind::NotFound {
+                            warn!(error = %err, path = %path.display(), "failed to delete compacted input table");
+                        }
+                    }
+                }
+
+                let mut metrics = self.metrics.compaction.lock();
+                metrics.record_compaction_write(completed.summary.file_size_bytes);
+                metrics.mark_compaction_complete();
+                info!(
+                    task_id = completed.task_id,
+                    output_table_id = completed.output_table_id,
+                    output_level = completed.output_level,
+                    output_file_size_bytes = completed.summary.file_size_bytes,
+                    "applied compaction output"
+                );
+            }
+            CompactionResponse::Empty { task_id, input_tables } => {
+                let manifest_result = (|| -> Result<(), EngineError> {
+                    let mut manifest = self.manifest.lock();
+                    for table in &input_tables {
+                        manifest.apply_edit(VersionEdit::RemoveTable {
+                            level: table.level,
+                            table_id: table.table_id,
+                        })?;
+                    }
+                    Ok(())
+                })();
+                if let Err(err) = manifest_result {
+                    self.release_compaction_task(task_id, &input_tables);
+                    return Err(err);
+                }
+
+                {
+                    let input_ids =
+                        input_tables.iter().map(|table| table.table_id).collect::<HashSet<_>>();
+                    let mut state = self.state.lock();
+                    state
+                        .sstables
+                        .retain(|runtime| !input_ids.contains(&runtime.metadata.table_id));
+                    self.release_compaction_task_locked(&mut state, task_id, &input_tables);
+                    self.refresh_compaction_space_metrics_locked(&state);
+                    self.schedule_pending_compactions_locked(&mut state)?;
+                }
+
+                for table in &input_tables {
+                    let path = self.sstable_dir.join(&table.file_name);
+                    if let Err(err) = std::fs::remove_file(&path) {
+                        if err.kind() != std::io::ErrorKind::NotFound {
+                            warn!(error = %err, path = %path.display(), "failed to delete compacted input table");
+                        }
+                    }
+                }
+
+                self.metrics.compaction.lock().mark_compaction_complete();
+                info!(task_id, "applied empty compaction result");
+            }
+            CompactionResponse::Failed { task_id, input_tables, error } => {
+                self.release_compaction_task(task_id, &input_tables);
+                warn!(task_id, error = %error, "compaction task failed");
+                return Err(EngineError::BackgroundCompaction(error));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn refresh_compaction_space_metrics_locked(&self, state: &EngineState) {
+        let total_bytes =
+            state.sstables.iter().map(|runtime| runtime.metadata.file_size_bytes).sum::<u64>();
+        self.metrics.compaction.lock().set_space_bytes(total_bytes, total_bytes);
+    }
+
+    fn release_compaction_task(&self, task_id: u64, input_tables: &[SSTableMetadata]) {
+        let mut state = self.state.lock();
+        self.release_compaction_task_locked(&mut state, task_id, input_tables);
+    }
+
+    fn release_compaction_task_locked(
+        &self,
+        state: &mut EngineState,
+        task_id: u64,
+        input_tables: &[SSTableMetadata],
+    ) {
+        state.compaction_scheduler.mark_completed(task_id);
+        for table in input_tables {
+            state.in_flight_compaction_tables.remove(&table.table_id);
+        }
+    }
+
+    fn stop_compaction_worker(&self) -> Result<(), EngineError> {
+        let handle = {
+            let mut guard = self.compaction_thread.lock();
+            if guard.is_none() {
+                return Ok(());
+            }
+            let _ = self.compaction_tx.send(CompactionRequest::Shutdown);
+            guard.take()
+        };
+
+        if let Some(handle) = handle {
+            handle.join().map_err(|_| {
+                EngineError::BackgroundCompaction(
+                    "compaction worker thread panicked during shutdown".to_string(),
+                )
+            })?;
         }
 
         Ok(())
@@ -720,6 +1121,127 @@ fn flush_one_memtable(task: FlushTask) -> FlushResponse {
             largest_key,
         }),
         Err(error) => FlushResponse::Failed { memtable: task.memtable, error: error.to_string() },
+    }
+}
+
+fn build_schedulable_version_set(state: &EngineState) -> VersionSet {
+    let mut versions = VersionSet::default();
+    for runtime in &state.sstables {
+        if state.in_flight_compaction_tables.contains(&runtime.metadata.table_id) {
+            continue;
+        }
+        versions.add_table(runtime.metadata.clone());
+    }
+    versions
+}
+
+fn compaction_plan_inputs(plan: &CompactionPlan) -> Vec<SSTableMetadata> {
+    let mut inputs = match plan {
+        CompactionPlan::Leveled(plan) => {
+            let mut tables = plan.source_inputs.clone();
+            tables.extend(plan.target_inputs.clone());
+            tables
+        }
+        CompactionPlan::Tiered(plan) => plan.input_tables.clone(),
+    };
+
+    inputs.sort_by_key(|table| table.table_id);
+    inputs.dedup_by_key(|table| table.table_id);
+    inputs
+}
+
+fn compaction_plan_output_level(plan: &CompactionPlan) -> u32 {
+    match plan {
+        CompactionPlan::Leveled(plan) => plan.target_level,
+        CompactionPlan::Tiered(plan) => plan.output_level,
+    }
+}
+
+fn compaction_worker_loop(
+    receiver: Receiver<CompactionRequest>,
+    result_tx: Sender<CompactionResponse>,
+) {
+    while let Ok(message) = receiver.recv() {
+        match message {
+            CompactionRequest::Compact(task) => {
+                let response = compact_one_task(task);
+                let _ = result_tx.send(response);
+            }
+            CompactionRequest::Shutdown => break,
+        }
+    }
+}
+
+fn compact_one_task(task: CompactionTask) -> CompactionResponse {
+    let task_id = task.scheduled.task_id;
+    let input_tables = task.input_tables.clone();
+    debug!(
+        task_id,
+        plan = ?task.scheduled.plan,
+        input_count = input_tables.len(),
+        "running compaction task"
+    );
+
+    let compacted = (|| -> Result<Option<CompactionCompleted>, String> {
+        let mut rows = Vec::new();
+        for table in &task.input_tables {
+            let path = task.sstable_dir.join(&table.file_name);
+            let reader = SSTableReader::open(&path).map_err(|err| err.to_string())?;
+            let scanned = reader.scan_range(None, None).map_err(|err| err.to_string())?;
+            for (key, value) in scanned {
+                rows.push((key, value, table.table_id));
+            }
+        }
+
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        rows.sort_by(|left, right| left.0.cmp(&right.0).then(left.2.cmp(&right.2)));
+
+        let mut merged = Vec::with_capacity(rows.len());
+        for (key, value, _table_id) in rows {
+            if let Some((last_key, last_value)) = merged.last_mut() {
+                if *last_key == key {
+                    *last_value = value;
+                    continue;
+                }
+            }
+
+            merged.push((key, value));
+        }
+
+        if merged.is_empty() {
+            return Ok(None);
+        }
+
+        let smallest_key = merged.first().map(|(key, _)| key.clone()).unwrap_or_default();
+        let largest_key = merged.last().map(|(key, _)| key.clone()).unwrap_or_default();
+
+        let summary = {
+            let mut builder = SSTableBuilder::create_with_options(&task.output_path, task.options)
+                .map_err(|err| err.to_string())?;
+            for (key, value) in &merged {
+                builder.add(key, value).map_err(|err| err.to_string())?;
+            }
+            builder.finish().map_err(|err| err.to_string())?
+        };
+
+        Ok(Some(CompactionCompleted {
+            task_id,
+            input_tables: input_tables.clone(),
+            output_table_id: task.output_table_id,
+            output_level: task.output_level,
+            summary,
+            smallest_key,
+            largest_key,
+        }))
+    })();
+
+    match compacted {
+        Ok(Some(compacted)) => CompactionResponse::Compacted(compacted),
+        Ok(None) => CompactionResponse::Empty { task_id, input_tables },
+        Err(error) => CompactionResponse::Failed { task_id, input_tables, error },
     }
 }
 
