@@ -1,8 +1,8 @@
 pub mod arena;
 pub mod skiplist;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use self::skiplist::SkipList;
 
@@ -291,7 +291,7 @@ mod tests {
 
     #[test]
     fn manager_promotes_mutable_when_size_limit_is_reached() {
-        let mut manager = MemTableManager::new(20, 32);
+        let mut manager = MemTableManager::new(40, 32);
 
         let promoted = manager.put(b"alpha", 1, b"1234567890");
         assert!(!promoted);

@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
 
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
@@ -16,11 +17,49 @@ use crate::sql::parser::{ParseError, parse_sql};
 use crate::sql::validator::{ValidationError, validate_statement};
 
 use super::protocol::{
-    ProtocolError, RequestFrame, RequestType, ResponseFrame, ResponsePayload,
-    payload_from_execution_result, read_request, write_response,
+    AdminStatusPayload, HealthPayload, PROTOCOL_VERSION, ProtocolError, ReadinessPayload,
+    RequestFrame, RequestType, ResponseFrame, ResponsePayload, payload_from_execution_result,
+    read_request, write_response,
 };
 
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug)]
+struct ServerRuntimeState {
+    started_at: Instant,
+    accepting_connections: AtomicBool,
+    active_connections: AtomicU64,
+    total_connections: AtomicU64,
+}
+
+impl ServerRuntimeState {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            accepting_connections: AtomicBool::new(true),
+            active_connections: AtomicU64::new(0),
+            total_connections: AtomicU64::new(0),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ConnectionGuard {
+    runtime_state: Arc<ServerRuntimeState>,
+}
+
+impl ConnectionGuard {
+    fn new(runtime_state: Arc<ServerRuntimeState>) -> Self {
+        runtime_state.active_connections.fetch_add(1, Ordering::Relaxed);
+        Self { runtime_state }
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.runtime_state.active_connections.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum ServerError {
@@ -83,9 +122,11 @@ pub async fn start_server(
     let local_addr = listener.local_addr()?;
     info!(%local_addr, "tcp server bound");
 
+    let runtime_state = Arc::new(ServerRuntimeState::new());
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let task =
-        tokio::spawn(async move { run_accept_loop(listener, catalog, store, shutdown_rx).await });
+    let task = tokio::spawn(async move {
+        run_accept_loop(listener, catalog, store, runtime_state, shutdown_rx).await
+    });
 
     Ok(ServerHandle { local_addr, shutdown_tx: Some(shutdown_tx), task: Some(task) })
 }
@@ -94,23 +135,27 @@ async fn run_accept_loop(
     listener: TcpListener,
     catalog: Arc<Catalog>,
     store: Arc<MvccStore>,
+    runtime_state: Arc<ServerRuntimeState>,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) -> Result<(), ServerError> {
     loop {
         tokio::select! {
             _ = &mut shutdown_rx => {
+                runtime_state.accepting_connections.store(false, Ordering::Relaxed);
                 info!("tcp accept loop received shutdown signal");
                 break;
             }
             accept_result = listener.accept() => {
                 let (stream, peer_addr) = accept_result?;
                 let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+                runtime_state.total_connections.fetch_add(1, Ordering::Relaxed);
                 info!(connection_id, %peer_addr, "accepted tcp connection");
                 let catalog = Arc::clone(&catalog);
                 let store = Arc::clone(&store);
+                let runtime_state = Arc::clone(&runtime_state);
                 let span = info_span!("connection", connection_id, %peer_addr);
                 tokio::spawn(async move {
-                    if let Err(err) = handle_connection(stream, catalog, store).await {
+                    if let Err(err) = handle_connection(stream, catalog, store, runtime_state).await {
                         warn!(error = %err, "connection task failed");
                     }
                 }.instrument(span));
@@ -125,7 +170,9 @@ async fn handle_connection(
     mut stream: TcpStream,
     catalog: Arc<Catalog>,
     store: Arc<MvccStore>,
+    runtime_state: Arc<ServerRuntimeState>,
 ) -> Result<(), ServerError> {
+    let _connection_guard = ConnectionGuard::new(Arc::clone(&runtime_state));
     let mut session = ExecutionSession::new(catalog.as_ref(), store.as_ref());
     debug!("connection session created");
 
@@ -139,16 +186,17 @@ async fn handle_connection(
         let sql_len = request.sql.len();
         debug!(request_type = ?request_type, sql_len, "received request frame");
 
-        let response = match execute_request(&mut session, &catalog, request) {
-            Ok(payload) => {
-                debug!(request_type = ?request_type, "request handled successfully");
-                ResponseFrame::Ok(payload)
-            }
-            Err(err) => {
-                warn!(request_type = ?request_type, error = %err, "request failed");
-                ResponseFrame::Err(err.to_string())
-            }
-        };
+        let response =
+            match execute_request(&mut session, &catalog, &store, &runtime_state, request) {
+                Ok(payload) => {
+                    debug!(request_type = ?request_type, "request handled successfully");
+                    ResponseFrame::Ok(payload)
+                }
+                Err(err) => {
+                    warn!(request_type = ?request_type, error = %err, "request failed");
+                    ResponseFrame::Err(err.to_string())
+                }
+            };
 
         if let Err(err) = write_response(&mut stream, &response).await {
             error!(error = %err, "failed to write response");
@@ -160,6 +208,8 @@ async fn handle_connection(
 fn execute_request(
     session: &mut ExecutionSession<'_>,
     catalog: &Catalog,
+    store: &MvccStore,
+    runtime_state: &ServerRuntimeState,
     request: RequestFrame,
 ) -> Result<super::protocol::ResponsePayload, RequestError> {
     debug!(request_type = ?request.request_type, "executing request");
@@ -176,6 +226,9 @@ fn execute_request(
         RequestType::Commit => execute_sql(session, catalog, "COMMIT"),
         RequestType::Rollback => execute_sql(session, catalog, "ROLLBACK"),
         RequestType::Explain => explain_sql(catalog, &request.sql),
+        RequestType::Health => Ok(health_payload()),
+        RequestType::Readiness => Ok(readiness_payload(runtime_state)),
+        RequestType::AdminStatus => Ok(admin_status_payload(store, runtime_state)),
     }
 }
 
@@ -222,4 +275,31 @@ fn explain_sql(catalog: &Catalog, sql: &str) -> Result<ResponsePayload, RequestE
     }
 
     Ok(ResponsePayload::ExplainPlan(rendered.join("\n\n")))
+}
+
+fn health_payload() -> ResponsePayload {
+    ResponsePayload::Health(HealthPayload { ok: true, status: "ok".to_string() })
+}
+
+fn readiness_payload(runtime_state: &ServerRuntimeState) -> ResponsePayload {
+    let ready = runtime_state.accepting_connections.load(Ordering::Relaxed);
+    let status = if ready { "ready" } else { "draining" };
+    ResponsePayload::Readiness(ReadinessPayload { ready, status: status.to_string() })
+}
+
+fn admin_status_payload(store: &MvccStore, runtime_state: &ServerRuntimeState) -> ResponsePayload {
+    let metrics = store.metrics();
+    ResponsePayload::AdminStatus(AdminStatusPayload {
+        server_version: env!("CARGO_PKG_VERSION").to_string(),
+        protocol_version: PROTOCOL_VERSION,
+        uptime_seconds: runtime_state.started_at.elapsed().as_secs(),
+        accepting_connections: runtime_state.accepting_connections.load(Ordering::Relaxed),
+        active_connections: runtime_state.active_connections.load(Ordering::Relaxed),
+        total_connections: runtime_state.total_connections.load(Ordering::Relaxed),
+        mvcc_started: metrics.started,
+        mvcc_committed: metrics.committed,
+        mvcc_rolled_back: metrics.rolled_back,
+        mvcc_write_conflicts: metrics.write_conflicts,
+        mvcc_active_transactions: u64::try_from(metrics.active_transactions).unwrap_or(u64::MAX),
+    })
 }

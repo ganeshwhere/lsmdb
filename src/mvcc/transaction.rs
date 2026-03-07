@@ -241,7 +241,7 @@ impl MvccStore {
 
             let split = versions
                 .iter()
-                .position(|version| version.commit_ts >= watermark_ts)
+                .position(|version| version.commit_ts > watermark_ts)
                 .unwrap_or(versions.len());
 
             if split <= 1 {

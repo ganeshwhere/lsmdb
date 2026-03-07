@@ -5,6 +5,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::executor::{ExecutionResult, QueryResult, ScalarValue};
 
+pub const PROTOCOL_VERSION: u16 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RequestType {
@@ -13,6 +15,9 @@ pub enum RequestType {
     Commit = 3,
     Rollback = 4,
     Explain = 5,
+    Health = 6,
+    Readiness = 7,
+    AdminStatus = 8,
 }
 
 impl TryFrom<u8> for RequestType {
@@ -25,6 +30,9 @@ impl TryFrom<u8> for RequestType {
             3 => Ok(RequestType::Commit),
             4 => Ok(RequestType::Rollback),
             5 => Ok(RequestType::Explain),
+            6 => Ok(RequestType::Health),
+            7 => Ok(RequestType::Readiness),
+            8 => Ok(RequestType::AdminStatus),
             other => {
                 Err(ProtocolError::InvalidFrame(format!("unknown request type byte: {other}")))
             }
@@ -50,12 +58,42 @@ pub enum ResponsePayload {
     AffectedRows(u64),
     TransactionState(TransactionState),
     ExplainPlan(String),
+    Health(HealthPayload),
+    Readiness(ReadinessPayload),
+    AdminStatus(AdminStatusPayload),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryPayload {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Vec<u8>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthPayload {
+    pub ok: bool,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadinessPayload {
+    pub ready: bool,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminStatusPayload {
+    pub server_version: String,
+    pub protocol_version: u16,
+    pub uptime_seconds: u64,
+    pub accepting_connections: bool,
+    pub active_connections: u64,
+    pub total_connections: u64,
+    pub mvcc_started: u64,
+    pub mvcc_committed: u64,
+    pub mvcc_rolled_back: u64,
+    pub mvcc_write_conflicts: u64,
+    pub mvcc_active_transactions: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,6 +333,30 @@ fn encode_payload(payload: &ResponsePayload, out: &mut Vec<u8>) -> Result<(), Pr
             out.push(4_u8);
             write_len_prefixed_bytes(out, plan.as_bytes())?;
         }
+        ResponsePayload::Health(health) => {
+            out.push(5_u8);
+            out.push(u8::from(health.ok));
+            write_len_prefixed_bytes(out, health.status.as_bytes())?;
+        }
+        ResponsePayload::Readiness(readiness) => {
+            out.push(6_u8);
+            out.push(u8::from(readiness.ready));
+            write_len_prefixed_bytes(out, readiness.status.as_bytes())?;
+        }
+        ResponsePayload::AdminStatus(status) => {
+            out.push(7_u8);
+            write_len_prefixed_bytes(out, status.server_version.as_bytes())?;
+            out.extend(status.protocol_version.to_be_bytes());
+            out.extend(status.uptime_seconds.to_be_bytes());
+            out.push(u8::from(status.accepting_connections));
+            out.extend(status.active_connections.to_be_bytes());
+            out.extend(status.total_connections.to_be_bytes());
+            out.extend(status.mvcc_started.to_be_bytes());
+            out.extend(status.mvcc_committed.to_be_bytes());
+            out.extend(status.mvcc_rolled_back.to_be_bytes());
+            out.extend(status.mvcc_write_conflicts.to_be_bytes());
+            out.extend(status.mvcc_active_transactions.to_be_bytes());
+        }
     }
     Ok(())
 }
@@ -343,6 +405,42 @@ fn decode_payload(cursor: &mut Cursor<&[u8]>) -> Result<ResponsePayload, Protoco
             let plan = read_len_prefixed_string(cursor)?;
             Ok(ResponsePayload::ExplainPlan(plan))
         }
+        5 => {
+            let ok = read_bool(cursor)?;
+            let status = read_len_prefixed_string(cursor)?;
+            Ok(ResponsePayload::Health(HealthPayload { ok, status }))
+        }
+        6 => {
+            let ready = read_bool(cursor)?;
+            let status = read_len_prefixed_string(cursor)?;
+            Ok(ResponsePayload::Readiness(ReadinessPayload { ready, status }))
+        }
+        7 => {
+            let server_version = read_len_prefixed_string(cursor)?;
+            let protocol_version = read_u16(cursor)?;
+            let uptime_seconds = read_u64(cursor)?;
+            let accepting_connections = read_bool(cursor)?;
+            let active_connections = read_u64(cursor)?;
+            let total_connections = read_u64(cursor)?;
+            let mvcc_started = read_u64(cursor)?;
+            let mvcc_committed = read_u64(cursor)?;
+            let mvcc_rolled_back = read_u64(cursor)?;
+            let mvcc_write_conflicts = read_u64(cursor)?;
+            let mvcc_active_transactions = read_u64(cursor)?;
+            Ok(ResponsePayload::AdminStatus(AdminStatusPayload {
+                server_version,
+                protocol_version,
+                uptime_seconds,
+                accepting_connections,
+                active_connections,
+                total_connections,
+                mvcc_started,
+                mvcc_committed,
+                mvcc_rolled_back,
+                mvcc_write_conflicts,
+                mvcc_active_transactions,
+            }))
+        }
         other => {
             Err(ProtocolError::InvalidFrame(format!("unknown response payload type: {other}")))
         }
@@ -381,6 +479,20 @@ fn read_u16(cursor: &mut Cursor<&[u8]>) -> Result<u16, ProtocolError> {
     Ok(u16::from_be_bytes(raw))
 }
 
+fn read_u64(cursor: &mut Cursor<&[u8]>) -> Result<u64, ProtocolError> {
+    let mut raw = [0_u8; 8];
+    read_exact(cursor, &mut raw)?;
+    Ok(u64::from_be_bytes(raw))
+}
+
+fn read_bool(cursor: &mut Cursor<&[u8]>) -> Result<bool, ProtocolError> {
+    match read_u8(cursor)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        other => Err(ProtocolError::InvalidFrame(format!("invalid bool byte: {other}"))),
+    }
+}
+
 fn read_u32(cursor: &mut Cursor<&[u8]>) -> Result<u32, ProtocolError> {
     let mut raw = [0_u8; 4];
     read_exact(cursor, &mut raw)?;
@@ -400,7 +512,7 @@ fn read_len_prefixed_bytes(cursor: &mut Cursor<&[u8]>) -> Result<Vec<u8>, Protoc
 }
 
 fn read_exact(cursor: &mut Cursor<&[u8]>, out: &mut [u8]) -> Result<(), ProtocolError> {
-    cursor.read_exact(out).map_err(|err| ProtocolError::InvalidFrame(err.to_string()))
+    Read::read_exact(cursor, out).map_err(|err| ProtocolError::InvalidFrame(err.to_string()))
 }
 
 #[cfg(test)]
@@ -432,6 +544,39 @@ mod tests {
         let response =
             ResponseFrame::Ok(ResponsePayload::ExplainPlan("PrimaryKeyScan(users)".to_string()));
         let (mut client, mut server) = tokio::io::duplex(1024);
+        write_response(&mut client, &response).await.expect("write response");
+        let decoded = read_response(&mut server).await.expect("read response").expect("response");
+        assert_eq!(decoded, response);
+    }
+
+    #[tokio::test]
+    async fn health_payload_round_trip() {
+        let response = ResponseFrame::Ok(ResponsePayload::Health(HealthPayload {
+            ok: true,
+            status: "ok".to_string(),
+        }));
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        write_response(&mut client, &response).await.expect("write response");
+        let decoded = read_response(&mut server).await.expect("read response").expect("response");
+        assert_eq!(decoded, response);
+    }
+
+    #[tokio::test]
+    async fn admin_status_payload_round_trip() {
+        let response = ResponseFrame::Ok(ResponsePayload::AdminStatus(AdminStatusPayload {
+            server_version: "0.1.0".to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            uptime_seconds: 42,
+            accepting_connections: true,
+            active_connections: 1,
+            total_connections: 4,
+            mvcc_started: 12,
+            mvcc_committed: 9,
+            mvcc_rolled_back: 2,
+            mvcc_write_conflicts: 1,
+            mvcc_active_transactions: 0,
+        }));
+        let (mut client, mut server) = tokio::io::duplex(2048);
         write_response(&mut client, &response).await.expect("write response");
         let decoded = read_response(&mut server).await.expect("read response").expect("response");
         assert_eq!(decoded, response);

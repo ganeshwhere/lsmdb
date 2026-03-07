@@ -78,7 +78,10 @@ impl WalWriter {
     }
 
     pub fn append(&mut self, payload: &[u8]) -> Result<(), WalWriteError> {
-        if self.segment_len >= self.options.segment_size_bytes {
+        let estimated_len = estimate_logical_record_len(payload.len(), self.block_offset) as u64;
+        if self.segment_len > 0
+            && self.segment_len.saturating_add(estimated_len) > self.options.segment_size_bytes
+        {
             self.rotate_segment()?;
         }
 
@@ -215,6 +218,40 @@ impl WalWriter {
         self.file.get_ref().sync_data()?;
         Ok(())
     }
+}
+
+fn estimate_logical_record_len(payload_len: usize, mut block_offset: usize) -> usize {
+    if payload_len == 0 {
+        let space_left = BLOCK_SIZE_BYTES - block_offset;
+        if space_left < HEADER_LEN {
+            return space_left + HEADER_LEN;
+        }
+        return HEADER_LEN;
+    }
+
+    let mut remaining = payload_len;
+    let mut written = 0usize;
+
+    while remaining > 0 {
+        let space_left = BLOCK_SIZE_BYTES - block_offset;
+        if space_left <= HEADER_LEN {
+            written += space_left;
+            block_offset = 0;
+            continue;
+        }
+
+        let fragment = remaining.min(space_left - HEADER_LEN);
+        let encoded_len = HEADER_LEN + fragment;
+        written += encoded_len;
+        remaining -= fragment;
+
+        block_offset += encoded_len;
+        if block_offset == BLOCK_SIZE_BYTES {
+            block_offset = 0;
+        }
+    }
+
+    written
 }
 
 fn next_segment_id(dir: &Path) -> io::Result<u64> {
