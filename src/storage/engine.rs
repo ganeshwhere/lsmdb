@@ -1197,19 +1197,7 @@ fn compact_one_task(task: CompactionTask) -> CompactionResponse {
             return Ok(None);
         }
 
-        rows.sort_by(|left, right| left.0.cmp(&right.0).then(left.2.cmp(&right.2)));
-
-        let mut merged = Vec::with_capacity(rows.len());
-        for (key, value, _table_id) in rows {
-            if let Some((last_key, last_value)) = merged.last_mut() {
-                if *last_key == key {
-                    *last_value = value;
-                    continue;
-                }
-            }
-
-            merged.push((key, value));
-        }
+        let merged = merge_compaction_rows(rows);
 
         if merged.is_empty() {
             return Ok(None);
@@ -1243,6 +1231,63 @@ fn compact_one_task(task: CompactionTask) -> CompactionResponse {
         Ok(None) => CompactionResponse::Empty { task_id, input_tables },
         Err(error) => CompactionResponse::Failed { task_id, input_tables, error },
     }
+}
+
+fn merge_compaction_rows(
+    mut rows: Vec<(Vec<u8>, Vec<u8>, u64)>,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    rows.sort_by(|left, right| left.0.cmp(&right.0).then(left.2.cmp(&right.2)));
+
+    // First collapse identical internal keys, preferring the newest table id.
+    let mut deduped = Vec::with_capacity(rows.len());
+    for (key, value, table_id) in rows {
+        if let Some((last_key, last_value, last_table_id)) = deduped.last_mut() {
+            if *last_key == key {
+                if table_id >= *last_table_id {
+                    *last_value = value;
+                    *last_table_id = table_id;
+                }
+                continue;
+            }
+        }
+
+        deduped.push((key, value, table_id));
+    }
+
+    // Then collapse MVCC history to only the latest sequence per user key.
+    let mut collapsed = Vec::with_capacity(deduped.len());
+    let mut current_user_key: Option<Vec<u8>> = None;
+    let mut current_latest: Option<(Vec<u8>, Vec<u8>)> = None;
+
+    for (internal_key, value, _) in deduped {
+        let Some(decoded) = decode_internal_key(&internal_key) else {
+            if let Some(latest) = current_latest.take() {
+                collapsed.push(latest);
+            }
+            current_user_key = None;
+            collapsed.push((internal_key, value));
+            continue;
+        };
+
+        match current_user_key.as_deref() {
+            Some(user_key) if user_key == decoded.user_key => {
+                current_latest = Some((internal_key, value));
+            }
+            _ => {
+                if let Some(latest) = current_latest.take() {
+                    collapsed.push(latest);
+                }
+                current_user_key = Some(decoded.user_key.to_vec());
+                current_latest = Some((internal_key, value));
+            }
+        }
+    }
+
+    if let Some(latest) = current_latest {
+        collapsed.push(latest);
+    }
+
+    collapsed
 }
 
 fn recover_from_wal(
@@ -1357,6 +1402,7 @@ fn sstable_file_name(table_id: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::memtable::encode_internal_key;
 
     #[test]
     fn prefix_end_computation() {
@@ -1375,5 +1421,45 @@ mod tests {
         let a = crate::storage::memtable::encode_internal_key(b"k", 1, ValueType::Put);
         let b = crate::storage::memtable::encode_internal_key(b"k", 2, ValueType::Put);
         assert!(a < b);
+    }
+
+    #[test]
+    fn merge_compaction_rows_keeps_latest_version_per_user_key() {
+        let rows = vec![
+            (encode_internal_key(b"user:1", 1, ValueType::Put), b"a".to_vec(), 10),
+            (encode_internal_key(b"user:1", 2, ValueType::Put), b"b".to_vec(), 11),
+            (encode_internal_key(b"user:1", 3, ValueType::Delete), Vec::new(), 12),
+            (encode_internal_key(b"user:2", 1, ValueType::Put), b"z".to_vec(), 20),
+            (encode_internal_key(b"user:2", 4, ValueType::Put), b"zz".to_vec(), 21),
+        ];
+
+        let merged = merge_compaction_rows(rows);
+        assert_eq!(merged.len(), 2);
+
+        let decoded_0 = decode_internal_key(&merged[0].0).expect("decode first key");
+        let decoded_1 = decode_internal_key(&merged[1].0).expect("decode second key");
+        assert_eq!(decoded_0.user_key, b"user:1");
+        assert_eq!(decoded_0.sequence, 3);
+        assert_eq!(decoded_0.value_type, ValueType::Delete);
+        assert_eq!(decoded_1.user_key, b"user:2");
+        assert_eq!(decoded_1.sequence, 4);
+        assert_eq!(merged[1].1, b"zz".to_vec());
+    }
+
+    #[test]
+    fn merge_compaction_rows_prefers_newest_table_for_duplicate_internal_keys() {
+        let duplicated = encode_internal_key(b"dup", 7, ValueType::Put);
+        let rows = vec![
+            (duplicated.clone(), b"old".to_vec(), 2),
+            (duplicated.clone(), b"new".to_vec(), 8),
+            (encode_internal_key(b"other", 1, ValueType::Put), b"x".to_vec(), 1),
+        ];
+
+        let merged = merge_compaction_rows(rows);
+        let dup_row = merged
+            .iter()
+            .find(|(key, _)| decode_internal_key(key).map(|k| k.user_key == b"dup").unwrap_or(false))
+            .expect("duplicate key row");
+        assert_eq!(dup_row.1, b"new".to_vec());
     }
 }
