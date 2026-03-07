@@ -114,6 +114,16 @@ impl From<SyncMode> for SyncModeConfig {
     }
 }
 
+impl SyncModeConfig {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SyncModeConfig::Never => "never",
+            SyncModeConfig::OnCommit => "on_commit",
+            SyncModeConfig::Always => "always",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SstableConfig {
@@ -208,6 +218,89 @@ pub struct RuntimeConfig {
     pub compaction_strategy: CompactionStrategy,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactionDiagnostics {
+    Leveled {
+        level0_file_limit: usize,
+        level_size_base_bytes: u64,
+        level_size_multiplier: u64,
+        max_levels: u32,
+    },
+    Tiered {
+        max_components_per_tier: usize,
+        min_tier_size_bytes: u64,
+        output_level: u32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupDiagnostics {
+    pub memtable_size_bytes: usize,
+    pub memtable_arena_block_size_bytes: usize,
+    pub flush_poll_interval_ms: u64,
+    pub flush_timeout_ms: u64,
+    pub wal_segment_size_bytes: u64,
+    pub wal_sync_mode: SyncModeConfig,
+    pub sstable_data_block_size_bytes: usize,
+    pub sstable_restart_interval: usize,
+    pub sstable_bloom_bits_per_key: usize,
+    pub sstable_bloom_hash_functions: u8,
+    pub compaction: CompactionDiagnostics,
+}
+
+impl StartupDiagnostics {
+    pub fn as_key_value_lines(&self) -> Vec<String> {
+        let mut lines = vec![
+            format!("storage.memtable_size_bytes={}", self.memtable_size_bytes),
+            format!(
+                "storage.memtable_arena_block_size_bytes={}",
+                self.memtable_arena_block_size_bytes
+            ),
+            format!("storage.flush_poll_interval_ms={}", self.flush_poll_interval_ms),
+            format!("storage.flush_timeout_ms={}", self.flush_timeout_ms),
+            format!("wal.segment_size_bytes={}", self.wal_segment_size_bytes),
+            format!("wal.sync_mode={}", self.wal_sync_mode.as_str()),
+            format!("sstable.data_block_size_bytes={}", self.sstable_data_block_size_bytes),
+            format!("sstable.restart_interval={}", self.sstable_restart_interval),
+            format!("sstable.bloom_bits_per_key={}", self.sstable_bloom_bits_per_key),
+            format!("sstable.bloom_hash_functions={}", self.sstable_bloom_hash_functions),
+        ];
+
+        match self.compaction {
+            CompactionDiagnostics::Leveled {
+                level0_file_limit,
+                level_size_base_bytes,
+                level_size_multiplier,
+                max_levels,
+            } => {
+                lines.push("compaction.strategy=leveled".to_string());
+                lines.push(format!("compaction.leveled.level0_file_limit={level0_file_limit}"));
+                lines.push(format!(
+                    "compaction.leveled.level_size_base_bytes={level_size_base_bytes}"
+                ));
+                lines.push(format!(
+                    "compaction.leveled.level_size_multiplier={level_size_multiplier}"
+                ));
+                lines.push(format!("compaction.leveled.max_levels={max_levels}"));
+            }
+            CompactionDiagnostics::Tiered {
+                max_components_per_tier,
+                min_tier_size_bytes,
+                output_level,
+            } => {
+                lines.push("compaction.strategy=tiered".to_string());
+                lines.push(format!(
+                    "compaction.tiered.max_components_per_tier={max_components_per_tier}"
+                ));
+                lines.push(format!("compaction.tiered.min_tier_size_bytes={min_tier_size_bytes}"));
+                lines.push(format!("compaction.tiered.output_level={output_level}"));
+            }
+        }
+
+        lines
+    }
+}
+
 impl LsmdbConfig {
     pub fn from_toml_str(raw: &str) -> Result<Self, ConfigError> {
         let config: Self = toml::from_str(raw)?;
@@ -229,11 +322,23 @@ impl LsmdbConfig {
         if self.storage.memtable_arena_block_size_bytes == 0 {
             return Err(invalid("storage.memtable_arena_block_size_bytes", "must be > 0"));
         }
+        if self.storage.memtable_arena_block_size_bytes > self.storage.memtable_size_bytes {
+            return Err(invalid(
+                "storage.memtable_arena_block_size_bytes",
+                "must be <= storage.memtable_size_bytes",
+            ));
+        }
         if self.storage.flush_poll_interval_ms == 0 {
             return Err(invalid("storage.flush_poll_interval_ms", "must be > 0"));
         }
         if self.storage.flush_timeout_ms == 0 {
             return Err(invalid("storage.flush_timeout_ms", "must be > 0"));
+        }
+        if self.storage.flush_timeout_ms < self.storage.flush_poll_interval_ms {
+            return Err(invalid(
+                "storage.flush_timeout_ms",
+                "must be >= storage.flush_poll_interval_ms",
+            ));
         }
         if self.wal.segment_size_bytes < MIN_WAL_SEGMENT_SIZE_BYTES {
             return Err(invalid(
@@ -270,6 +375,38 @@ impl LsmdbConfig {
         }
 
         Ok(())
+    }
+
+    pub fn startup_diagnostics(&self) -> Result<StartupDiagnostics, ConfigError> {
+        let runtime = self.to_runtime_config()?;
+        let storage = runtime.storage_engine;
+        let compaction = match runtime.compaction_strategy {
+            CompactionStrategy::Leveled(config) => CompactionDiagnostics::Leveled {
+                level0_file_limit: config.level0_file_limit,
+                level_size_base_bytes: config.level_size_base_bytes,
+                level_size_multiplier: config.level_size_multiplier,
+                max_levels: config.max_levels,
+            },
+            CompactionStrategy::Tiered(config) => CompactionDiagnostics::Tiered {
+                max_components_per_tier: config.max_components_per_tier,
+                min_tier_size_bytes: config.min_tier_size_bytes,
+                output_level: config.output_level,
+            },
+        };
+
+        Ok(StartupDiagnostics {
+            memtable_size_bytes: storage.memtable_size_bytes,
+            memtable_arena_block_size_bytes: storage.memtable_arena_block_size_bytes,
+            flush_poll_interval_ms: storage.flush_poll_interval.as_millis() as u64,
+            flush_timeout_ms: storage.flush_timeout.as_millis() as u64,
+            wal_segment_size_bytes: storage.wal_options.segment_size_bytes,
+            wal_sync_mode: SyncModeConfig::from(storage.wal_options.sync_mode),
+            sstable_data_block_size_bytes: storage.sstable_builder_options.data_block_size_bytes,
+            sstable_restart_interval: storage.sstable_builder_options.restart_interval,
+            sstable_bloom_bits_per_key: storage.sstable_builder_options.bloom_bits_per_key,
+            sstable_bloom_hash_functions: storage.sstable_builder_options.bloom_hash_functions,
+            compaction,
+        })
     }
 
     pub fn to_runtime_config(&self) -> Result<RuntimeConfig, ConfigError> {
@@ -454,5 +591,66 @@ mod tests {
         assert_eq!(config.storage.memtable_size_bytes, 8192);
 
         fs::remove_file(path).expect("cleanup temp config");
+    }
+
+    #[test]
+    fn rejects_arena_block_larger_than_memtable() {
+        let raw = r#"
+            [storage]
+            memtable_size_bytes = 4096
+            memtable_arena_block_size_bytes = 8192
+        "#;
+
+        let err = LsmdbConfig::from_toml_str(raw).expect_err("invalid arena block size");
+        assert!(matches!(
+            err,
+            ConfigError::InvalidValue { field, .. }
+            if field == "storage.memtable_arena_block_size_bytes"
+        ));
+    }
+
+    #[test]
+    fn rejects_flush_timeout_smaller_than_poll_interval() {
+        let raw = r#"
+            [storage]
+            flush_poll_interval_ms = 100
+            flush_timeout_ms = 50
+        "#;
+
+        let err = LsmdbConfig::from_toml_str(raw).expect_err("invalid flush timing");
+        assert!(
+            matches!(err, ConfigError::InvalidValue { field, .. } if field == "storage.flush_timeout_ms")
+        );
+    }
+
+    #[test]
+    fn emits_startup_diagnostics_for_runtime_config() {
+        let raw = r#"
+            [storage]
+            memtable_size_bytes = 8192
+            memtable_arena_block_size_bytes = 4096
+            flush_poll_interval_ms = 25
+            flush_timeout_ms = 100
+
+            [wal]
+            segment_size_bytes = 4096
+            sync_mode = "on_commit"
+
+            [compaction]
+            strategy = "leveled"
+        "#;
+
+        let config = LsmdbConfig::from_toml_str(raw).expect("parse valid config");
+        let diagnostics = config.startup_diagnostics().expect("startup diagnostics");
+        assert_eq!(diagnostics.memtable_size_bytes, 8192);
+        assert_eq!(diagnostics.memtable_arena_block_size_bytes, 4096);
+        assert_eq!(diagnostics.flush_poll_interval_ms, 25);
+        assert_eq!(diagnostics.flush_timeout_ms, 100);
+        assert_eq!(diagnostics.wal_segment_size_bytes, 4096);
+        assert_eq!(diagnostics.wal_sync_mode, SyncModeConfig::OnCommit);
+
+        let lines = diagnostics.as_key_value_lines();
+        assert!(lines.iter().any(|line| line == "compaction.strategy=leveled"));
+        assert!(lines.iter().any(|line| line.starts_with("sstable.bloom_bits_per_key=")));
     }
 }
