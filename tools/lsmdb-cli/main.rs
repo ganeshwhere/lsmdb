@@ -20,7 +20,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut stream = TcpStream::connect(addr).await?;
 
     println!("Connected to lsmdb server at {addr}");
-    println!("Type SQL to execute. Meta commands: \\help, \\q, \\timing, \\explain <sql>");
+    println!(
+        "Type SQL to execute. Meta commands: \\help, \\q, \\timing, \\explain <sql>, \\health, \\ready, \\status"
+    );
 
     let mut timing_enabled = false;
     let stdin = io::stdin();
@@ -135,6 +137,51 @@ async fn handle_meta_command(
         return Ok(ControlFlow::Continue);
     }
 
+    if input == "\\health" {
+        let start = Instant::now();
+        let response = send_request(
+            stream,
+            RequestFrame { request_type: RequestType::Health, sql: String::new() },
+        )
+        .await?;
+        let elapsed = start.elapsed();
+        render_response(response);
+        if *timing_enabled {
+            println!("Time: {:.3} ms", elapsed.as_secs_f64() * 1000.0);
+        }
+        return Ok(ControlFlow::Continue);
+    }
+
+    if input == "\\ready" {
+        let start = Instant::now();
+        let response = send_request(
+            stream,
+            RequestFrame { request_type: RequestType::Readiness, sql: String::new() },
+        )
+        .await?;
+        let elapsed = start.elapsed();
+        render_response(response);
+        if *timing_enabled {
+            println!("Time: {:.3} ms", elapsed.as_secs_f64() * 1000.0);
+        }
+        return Ok(ControlFlow::Continue);
+    }
+
+    if input == "\\status" {
+        let start = Instant::now();
+        let response = send_request(
+            stream,
+            RequestFrame { request_type: RequestType::AdminStatus, sql: String::new() },
+        )
+        .await?;
+        let elapsed = start.elapsed();
+        render_response(response);
+        if *timing_enabled {
+            println!("Time: {:.3} ms", elapsed.as_secs_f64() * 1000.0);
+        }
+        return Ok(ControlFlow::Continue);
+    }
+
     println!("Unknown command: {input}. Use \\help for available commands.");
     Ok(ControlFlow::Continue)
 }
@@ -175,6 +222,33 @@ fn render_response(response: ResponseFrame) {
                 TransactionState::RolledBack => println!("Transaction rolled back"),
             },
             ResponsePayload::ExplainPlan(plan) => println!("{plan}"),
+            ResponsePayload::Health(health) => {
+                println!(
+                    "health: {} ({})",
+                    if health.ok { "ok" } else { "unhealthy" },
+                    health.status
+                )
+            }
+            ResponsePayload::Readiness(readiness) => {
+                println!(
+                    "readiness: {} ({})",
+                    if readiness.ready { "ready" } else { "not-ready" },
+                    readiness.status
+                )
+            }
+            ResponsePayload::AdminStatus(status) => {
+                println!("server_version: {}", status.server_version);
+                println!("protocol_version: {}", status.protocol_version);
+                println!("uptime_seconds: {}", status.uptime_seconds);
+                println!("accepting_connections: {}", status.accepting_connections);
+                println!("active_connections: {}", status.active_connections);
+                println!("total_connections: {}", status.total_connections);
+                println!("mvcc_started: {}", status.mvcc_started);
+                println!("mvcc_committed: {}", status.mvcc_committed);
+                println!("mvcc_rolled_back: {}", status.mvcc_rolled_back);
+                println!("mvcc_write_conflicts: {}", status.mvcc_write_conflicts);
+                println!("mvcc_active_transactions: {}", status.mvcc_active_transactions);
+            }
         },
         ResponseFrame::Err(message) => {
             eprintln!("Error: {message}");
@@ -262,4 +336,7 @@ fn print_help() {
     println!("  \\q | \\quit            Exit CLI");
     println!("  \\timing               Toggle query timing display");
     println!("  \\explain <sql>        Print physical plan without executing SQL");
+    println!("  \\health               Request liveness status");
+    println!("  \\ready                Request readiness status");
+    println!("  \\status               Request admin runtime diagnostics");
 }

@@ -5,8 +5,9 @@ use std::sync::Arc;
 use lsmdb::catalog::Catalog;
 use lsmdb::mvcc::MvccStore;
 use lsmdb::server::{
-    QueryPayload, RequestFrame, RequestType, ResponseFrame, ResponsePayload, TransactionState,
-    read_response, start_server, write_request,
+    AdminStatusPayload, HealthPayload, PROTOCOL_VERSION, QueryPayload, ReadinessPayload,
+    RequestFrame, RequestType, ResponseFrame, ResponsePayload, TransactionState, read_response,
+    start_server, write_request,
 };
 use tokio::net::TcpStream;
 
@@ -26,6 +27,27 @@ fn response_to_explain(response: ResponseFrame) -> String {
     match response {
         ResponseFrame::Ok(ResponsePayload::ExplainPlan(plan)) => plan,
         other => panic!("expected explain payload, got {other:?}"),
+    }
+}
+
+fn response_to_health(response: ResponseFrame) -> HealthPayload {
+    match response {
+        ResponseFrame::Ok(ResponsePayload::Health(payload)) => payload,
+        other => panic!("expected health payload, got {other:?}"),
+    }
+}
+
+fn response_to_readiness(response: ResponseFrame) -> ReadinessPayload {
+    match response {
+        ResponseFrame::Ok(ResponsePayload::Readiness(payload)) => payload,
+        other => panic!("expected readiness payload, got {other:?}"),
+    }
+}
+
+fn response_to_admin_status(response: ResponseFrame) -> AdminStatusPayload {
+    match response {
+        ResponseFrame::Ok(ResponsePayload::AdminStatus(payload)) => payload,
+        other => panic!("expected admin status payload, got {other:?}"),
     }
 }
 
@@ -204,6 +226,60 @@ async fn server_tracks_transaction_state_per_connection() {
     let after_query = response_to_query(after_commit);
     assert_eq!(after_query.rows.len(), 1);
     assert_eq!(from_utf8(&after_query.rows[0][0]).expect("utf8 cell"), "10");
+
+    server.shutdown().await.expect("shutdown server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_exposes_health_readiness_and_admin_status() {
+    let store = Arc::new(MvccStore::new());
+    let catalog = Arc::new(Catalog::open((*store).clone()).expect("open catalog"));
+
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("parse socket addr");
+    let server = start_server(bind_addr, Arc::clone(&catalog), Arc::clone(&store))
+        .await
+        .expect("start server");
+    let server_addr = server.local_addr();
+
+    let mut client = TcpStream::connect(server_addr).await.expect("connect client");
+
+    let health = response_to_health(
+        send_request(
+            &mut client,
+            RequestFrame { request_type: RequestType::Health, sql: String::new() },
+        )
+        .await,
+    );
+    assert!(health.ok);
+    assert_eq!(health.status, "ok");
+
+    let readiness = response_to_readiness(
+        send_request(
+            &mut client,
+            RequestFrame { request_type: RequestType::Readiness, sql: String::new() },
+        )
+        .await,
+    );
+    assert!(readiness.ready);
+    assert_eq!(readiness.status, "ready");
+
+    let admin = response_to_admin_status(
+        send_request(
+            &mut client,
+            RequestFrame { request_type: RequestType::AdminStatus, sql: String::new() },
+        )
+        .await,
+    );
+    assert_eq!(admin.protocol_version, PROTOCOL_VERSION);
+    assert_eq!(admin.server_version, env!("CARGO_PKG_VERSION"));
+    assert!(admin.accepting_connections);
+    assert!(admin.total_connections >= 1);
+    assert!(admin.active_connections >= 1);
+    assert_eq!(admin.mvcc_started, 0);
+    assert_eq!(admin.mvcc_committed, 0);
+    assert_eq!(admin.mvcc_rolled_back, 0);
+    assert_eq!(admin.mvcc_write_conflicts, 0);
+    assert_eq!(admin.mvcc_active_transactions, 0);
 
     server.shutdown().await.expect("shutdown server");
 }
