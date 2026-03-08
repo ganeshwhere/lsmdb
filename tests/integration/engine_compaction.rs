@@ -106,10 +106,7 @@ fn compaction_collapses_old_versions_for_same_user_key() {
             .wait_for_background_compaction(Duration::from_secs(5))
             .expect("background compaction should complete");
 
-        assert_eq!(
-            engine.get(b"hot-key").expect("read hot key"),
-            Some(b"hot-09".to_vec())
-        );
+        assert_eq!(engine.get(b"hot-key").expect("read hot key"), Some(b"hot-09".to_vec()));
 
         let mut hot_versions = 0_usize;
         for table in engine.sstable_metadata() {

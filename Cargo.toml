@@ -13,6 +13,46 @@ path = "tools/lsmdb-cli/main.rs"
 name = "lsmdb-admin"
 path = "tools/lsmdb-admin/main.rs"
 
+[[test]]
+name = "integration_catalog"
+path = "tests/integration/catalog.rs"
+
+[[test]]
+name = "integration_compaction"
+path = "tests/integration/compaction.rs"
+
+[[test]]
+name = "integration_engine_compaction"
+path = "tests/integration/engine_compaction.rs"
+
+[[test]]
+name = "integration_engine_recovery"
+path = "tests/integration/engine_recovery.rs"
+
+[[test]]
+name = "integration_executor"
+path = "tests/integration/executor.rs"
+
+[[test]]
+name = "integration_mvcc_isolation"
+path = "tests/integration/mvcc_isolation.rs"
+
+[[test]]
+name = "integration_planner"
+path = "tests/integration/planner.rs"
+
+[[test]]
+name = "integration_server"
+path = "tests/integration/server.rs"
+
+[[test]]
+name = "integration_sql_e2e"
+path = "tests/integration/sql_e2e.rs"
+
+[[test]]
+name = "integration_wal_recovery"
+path = "tests/integration/wal_recovery.rs"
+
 [[bench]]
 name = "write_throughput"
 harness = false
