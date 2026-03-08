@@ -78,3 +78,58 @@ fn sql_data_and_catalog_survive_restart_with_durable_mvcc_store() {
 
     fs::remove_dir_all(dir).expect("cleanup temp dir");
 }
+
+#[test]
+fn rolled_back_and_uncommitted_sql_writes_are_not_visible_after_restart() {
+    let dir = test_dir("rollback");
+
+    {
+        let store = MvccStore::open_persistent(&dir).expect("open durable store");
+        let catalog = Catalog::open(store.clone()).expect("open catalog");
+        let mut session = ExecutionSession::new(&catalog, &store);
+
+        execute_sql(
+            &mut session,
+            &catalog,
+            "CREATE TABLE accounts (
+                id BIGINT NOT NULL,
+                email TEXT NOT NULL,
+                PRIMARY KEY (id)
+            )",
+        );
+
+        execute_sql(&mut session, &catalog, "BEGIN ISOLATION LEVEL SNAPSHOT");
+        execute_sql(
+            &mut session,
+            &catalog,
+            "INSERT INTO accounts (id, email) VALUES (10, 'rollback@x.com')",
+        );
+        execute_sql(&mut session, &catalog, "ROLLBACK");
+
+        execute_sql(&mut session, &catalog, "BEGIN ISOLATION LEVEL SNAPSHOT");
+        execute_sql(
+            &mut session,
+            &catalog,
+            "INSERT INTO accounts (id, email) VALUES (11, 'uncommitted@x.com')",
+        );
+        // Intentionally drop the session without COMMIT to simulate crash before ack.
+    }
+
+    {
+        let store = MvccStore::open_persistent(&dir).expect("reopen durable store");
+        let catalog = Catalog::open(store.clone()).expect("reopen catalog");
+        let mut session = ExecutionSession::new(&catalog, &store);
+
+        let result = execute_sql(
+            &mut session,
+            &catalog,
+            "SELECT id FROM accounts WHERE id = 10 OR id = 11 ORDER BY id ASC",
+        );
+        let ExecutionResult::Query(query) = result else {
+            panic!("expected query result");
+        };
+        assert!(query.rows.is_empty());
+    }
+
+    fs::remove_dir_all(dir).expect("cleanup temp dir");
+}
