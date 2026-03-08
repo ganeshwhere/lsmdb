@@ -27,6 +27,12 @@ An LSM-tree based relational database built in Rust.
 - full test run: `cargo test --locked`
 - details: `docs/testing.md`
 
+## Release Gate
+
+- release readiness criteria: `docs/release_gate.md`
+- local critical blocker check: `./tools/release/check_critical_blockers.sh <owner>/<repo>`
+- CI release gate workflow: `.github/workflows/release-gate.yml`
+
 ## Collaborate
 
 You can collaborate on this repository to help build a production-capable database.
