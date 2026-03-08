@@ -1,6 +1,6 @@
 use lsmdb::storage::compaction::{
-    pick_leveled_compaction, pick_tiered_compaction, CompactionScheduler, CompactionStrategy,
-    LeveledCompactionConfig, LeveledTrigger, TieredCompactionConfig,
+    CompactionScheduler, CompactionStrategy, LeveledCompactionConfig, LeveledTrigger,
+    TieredCompactionConfig, pick_leveled_compaction, pick_tiered_compaction,
 };
 use lsmdb::storage::manifest::version::{SSTableMetadata, VersionSet};
 

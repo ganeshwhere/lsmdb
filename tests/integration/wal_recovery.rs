@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lsmdb::storage::wal::{
-    SyncMode, WalReader, WalWriter, WalWriterOptions, BLOCK_SIZE_BYTES, DEFAULT_SEGMENT_SIZE_BYTES,
+    BLOCK_SIZE_BYTES, DEFAULT_SEGMENT_SIZE_BYTES, SyncMode, WalReader, WalWriter, WalWriterOptions,
 };
 
 fn test_dir(label: &str) -> PathBuf {

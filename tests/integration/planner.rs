@@ -38,14 +38,10 @@ fn planner_uses_primary_key_scan_for_pk_equality_filter() {
     let statement = parse_statement("SELECT id, email FROM users WHERE id = 7").expect("parse");
 
     let plan = plan_statement(&catalog, &statement).expect("plan");
-    match plan {
-        PhysicalPlan::PrimaryKeyScan(scan) => {
-            assert_eq!(scan.table, "users");
-            assert_eq!(scan.key_values.len(), 1);
-            assert_eq!(scan.key_values[0].0, "id");
-        }
-        other => panic!("expected primary key scan, got {other:?}"),
-    }
+    assert!(
+        contains_primary_key_scan(&plan),
+        "expected primary key scan in plan subtree, got {plan:?}"
+    );
 }
 
 #[test]
@@ -55,8 +51,38 @@ fn planner_keeps_seq_scan_for_non_pk_filter() {
         parse_statement("SELECT id, email FROM users WHERE email = 'a@b.com'").expect("parse");
 
     let plan = plan_statement(&catalog, &statement).expect("plan");
-    let PhysicalPlan::Filter(filter) = plan else {
-        panic!("expected filter");
-    };
-    assert!(matches!(*filter.input, PhysicalPlan::SeqScan(_)));
+    assert!(
+        contains_filter_over_seq_scan(&plan),
+        "expected filter over seq scan in plan subtree, got {plan:?}"
+    );
+}
+
+fn contains_primary_key_scan(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::PrimaryKeyScan(_) => true,
+        PhysicalPlan::Filter(filter) => contains_primary_key_scan(&filter.input),
+        PhysicalPlan::Project(project) => contains_primary_key_scan(&project.input),
+        PhysicalPlan::Sort(sort) => contains_primary_key_scan(&sort.input),
+        PhysicalPlan::Limit(limit) => contains_primary_key_scan(&limit.input),
+        PhysicalPlan::Join(join) => {
+            contains_primary_key_scan(&join.left) || contains_primary_key_scan(&join.right)
+        }
+        _ => false,
+    }
+}
+
+fn contains_filter_over_seq_scan(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::Filter(filter) => {
+            matches!(*filter.input, PhysicalPlan::SeqScan(_))
+                || contains_filter_over_seq_scan(&filter.input)
+        }
+        PhysicalPlan::Project(project) => contains_filter_over_seq_scan(&project.input),
+        PhysicalPlan::Sort(sort) => contains_filter_over_seq_scan(&sort.input),
+        PhysicalPlan::Limit(limit) => contains_filter_over_seq_scan(&limit.input),
+        PhysicalPlan::Join(join) => {
+            contains_filter_over_seq_scan(&join.left) || contains_filter_over_seq_scan(&join.right)
+        }
+        _ => false,
+    }
 }

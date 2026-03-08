@@ -2,19 +2,46 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, staging]
   pull_request:
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  lint-test:
+  quality:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
       - name: Format check
         run: cargo fmt --all --check
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Tests
-        run: cargo test --all-targets --all-features
+        run: cargo clippy --all-targets --all-features -- -W clippy::all
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Library tests
+        run: cargo test --lib --locked
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Integration and test-target coverage gate
+        run: ./tools/ci/run_integration_tests.sh

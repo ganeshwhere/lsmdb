@@ -20,6 +20,13 @@ An LSM-tree based relational database built in Rust.
 - `tools/lsmdb-cli/` CLI client
 - `docs/` architecture and component docs
 
+## Testing
+
+- library tests: `cargo test --lib --locked`
+- integration suite gate: `./tools/ci/run_integration_tests.sh`
+- full test run: `cargo test --locked`
+- details: `docs/testing.md`
+
 ## Collaborate
 
 You can collaborate on this repository to help build a production-capable database.
