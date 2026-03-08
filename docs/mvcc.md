@@ -21,7 +21,7 @@ Transactions read at a fixed `read_ts` and stage writes locally until commit.
   - tracks pinned read timestamps
   - reports oldest active snapshot and active snapshot count
 - `transaction.rs` (`MvccStore`, `Transaction`)
-  - in-memory committed version store
+  - MVCC committed version store with optional durable backing
   - transaction API + conflict checks + metrics
 - `gc.rs`
   - prune obsolete versions behind snapshot watermark
@@ -79,10 +79,14 @@ Pruning rule:
 - write_conflicts
 - active_transactions
 
-## Current limitation
+## Durability modes
 
-`MvccStore` is currently an in-memory `HashMap`-backed version store.
+`MvccStore` supports two modes:
 
-Implication:
-- SQL/server transaction behavior is correct for in-process semantics
-- committed SQL data is not yet durable across process restart via the LSM storage engine
+- In-memory mode (`MvccStore::new()`)
+  - Uses only in-process `HashMap` state.
+  - Best for unit tests and fast local execution.
+- Durable mode (`MvccStore::open_persistent*()` / `MvccStore::with_storage_engine()`)
+  - Persists committed MVCC state into `StorageEngine` under an internal key.
+  - Reloads committed versions and oracle position on restart.
+  - Allows SQL/catalog state to survive process restarts while preserving MVCC semantics.
