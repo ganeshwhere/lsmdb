@@ -1,15 +1,21 @@
 use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, trace, warn};
+
+use crate::storage::engine::{StorageEngine, StorageEngineOptions};
 
 use super::snapshot::{Snapshot, SnapshotRegistry};
 use super::timestamp::TimestampOracle;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+const MVCC_DURABLE_STATE_KEY: &[u8] = b"__mvcc__/state";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommittedVersion {
     pub commit_ts: u64,
     pub value: Option<Vec<u8>>,
@@ -23,6 +29,8 @@ pub enum TransactionError {
     WriteWriteConflict { key: String, read_ts: u64, conflicting_commit_ts: u64 },
     #[error("transaction is no longer active")]
     Closed,
+    #[error("durable MVCC persistence error: {0}")]
+    Persistence(String),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -50,6 +58,7 @@ struct MvccStoreInner {
     oracle: TimestampOracle,
     snapshots: SnapshotRegistry,
     data: RwLock<MvccStoreData>,
+    durable_engine: Option<Arc<StorageEngine>>,
     metrics: TransactionMetricsState,
 }
 
@@ -74,11 +83,44 @@ impl Default for MvccStore {
 
 impl MvccStore {
     pub fn new() -> Self {
+        Self::from_parts(MvccStoreData::default(), None, 0)
+    }
+
+    pub fn with_storage_engine(engine: Arc<StorageEngine>) -> Result<Self, TransactionError> {
+        let data = load_durable_state(engine.as_ref())?;
+        let max_commit_ts = max_commit_ts_for_data(&data);
+        Ok(Self::from_parts(data, Some(engine), max_commit_ts))
+    }
+
+    pub fn open_persistent<P: AsRef<Path>>(root_dir: P) -> Result<Self, TransactionError> {
+        Self::open_persistent_with_options(root_dir, StorageEngineOptions::default())
+    }
+
+    pub fn open_persistent_with_options<P: AsRef<Path>>(
+        root_dir: P,
+        options: StorageEngineOptions,
+    ) -> Result<Self, TransactionError> {
+        let engine = StorageEngine::open_with_options(root_dir, options).map_err(|err| {
+            TransactionError::Persistence(format!("open storage engine failed: {err}"))
+        })?;
+        Self::with_storage_engine(Arc::new(engine))
+    }
+
+    pub fn is_durable(&self) -> bool {
+        self.inner.durable_engine.is_some()
+    }
+
+    fn from_parts(
+        data: MvccStoreData,
+        durable_engine: Option<Arc<StorageEngine>>,
+        initial_timestamp: u64,
+    ) -> Self {
         Self {
             inner: Arc::new(MvccStoreInner {
-                oracle: TimestampOracle::default(),
+                oracle: TimestampOracle::new(initial_timestamp),
                 snapshots: SnapshotRegistry::default(),
-                data: RwLock::new(MvccStoreData::default()),
+                data: RwLock::new(data),
+                durable_engine,
                 metrics: TransactionMetricsState::default(),
             }),
         }
@@ -218,10 +260,28 @@ impl MvccStore {
         }
 
         let commit_ts = self.inner.oracle.next_timestamp();
+        let mut previous_versions = Vec::with_capacity(writes.len());
 
         for (key, value) in writes {
+            previous_versions.push((key.clone(), data.versions.get(key).cloned()));
             let entry = data.versions.entry(key.clone()).or_default();
             entry.push(CommittedVersion { commit_ts, value: value.clone() });
+        }
+
+        if let Some(engine) = self.inner.durable_engine.as_ref() {
+            if let Err(err) = persist_durable_state(engine.as_ref(), &data.versions) {
+                for (key, previous) in previous_versions {
+                    match previous {
+                        Some(versions) => {
+                            data.versions.insert(key, versions);
+                        }
+                        None => {
+                            data.versions.remove(&key);
+                        }
+                    }
+                }
+                return Err(err);
+            }
         }
 
         trace!(commit_ts, write_count = writes.len(), "commit applied");
@@ -231,8 +291,9 @@ impl MvccStore {
     pub(crate) fn prune_versions_older_than(&self, watermark_ts: u64) -> PruneStats {
         let mut data = self.inner.data.write();
         let mut stats = PruneStats::default();
+        let mut previous_versions = Vec::new();
 
-        for versions in data.versions.values_mut() {
+        for (key, versions) in data.versions.iter_mut() {
             stats.scanned_keys = stats.scanned_keys.saturating_add(1);
 
             if versions.len() <= 1 {
@@ -248,13 +309,65 @@ impl MvccStore {
                 continue;
             }
 
+            previous_versions.push((key.clone(), versions.clone()));
             let remove_count = split - 1;
             versions.drain(0..remove_count);
             stats.removed_versions = stats.removed_versions.saturating_add(remove_count as u64);
         }
 
+        if stats.removed_versions > 0 {
+            if let Some(engine) = self.inner.durable_engine.as_ref() {
+                if let Err(err) = persist_durable_state(engine.as_ref(), &data.versions) {
+                    warn!(error = %err, "failed to persist GC-pruned MVCC state; reverting prune");
+                    for (key, versions) in previous_versions {
+                        data.versions.insert(key, versions);
+                    }
+                    stats.removed_versions = 0;
+                }
+            }
+        }
+
         stats
     }
+}
+
+fn load_durable_state(engine: &StorageEngine) -> Result<MvccStoreData, TransactionError> {
+    let Some(raw) = engine.get(MVCC_DURABLE_STATE_KEY).map_err(|err| {
+        TransactionError::Persistence(format!("load durable MVCC state failed: {err}"))
+    })?
+    else {
+        return Ok(MvccStoreData::default());
+    };
+
+    let versions =
+        bincode::deserialize::<HashMap<Vec<u8>, Vec<CommittedVersion>>>(&raw).map_err(|err| {
+            TransactionError::Persistence(format!("decode durable MVCC state failed: {err}"))
+        })?;
+
+    Ok(MvccStoreData { versions })
+}
+
+fn persist_durable_state(
+    engine: &StorageEngine,
+    versions: &HashMap<Vec<u8>, Vec<CommittedVersion>>,
+) -> Result<(), TransactionError> {
+    let payload = bincode::serialize(versions).map_err(|err| {
+        TransactionError::Persistence(format!("encode durable MVCC state failed: {err}"))
+    })?;
+
+    engine.put(MVCC_DURABLE_STATE_KEY, &payload).map_err(|err| {
+        TransactionError::Persistence(format!("persist durable MVCC state failed: {err}"))
+    })?;
+
+    Ok(())
+}
+
+fn max_commit_ts_for_data(data: &MvccStoreData) -> u64 {
+    data.versions
+        .values()
+        .filter_map(|versions| versions.last().map(|version| version.commit_ts))
+        .max()
+        .unwrap_or(0)
 }
 
 #[derive(Debug)]
@@ -374,9 +487,23 @@ impl Drop for Transaction {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
     use std::thread;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    fn test_dir(label: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        path.push(format!("lsmdb-mvcc-{label}-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
 
     #[test]
     fn transaction_commit_and_visibility() {
@@ -499,5 +626,38 @@ mod tests {
             rows,
             vec![(b"k/b".to_vec(), b"v1".to_vec()), (b"k/c".to_vec(), b"v2".to_vec())]
         );
+    }
+
+    #[test]
+    fn durable_store_recovers_versions_and_advances_timestamp_after_restart() {
+        let dir = test_dir("durable-recovery");
+
+        {
+            let store = MvccStore::open_persistent(&dir).expect("open durable store");
+            assert!(store.is_durable());
+
+            let mut tx = store.begin_transaction();
+            tx.put(b"k", b"v1").expect("write v1");
+            assert_eq!(tx.commit().expect("commit v1"), 1);
+
+            let mut tx = store.begin_transaction();
+            tx.put(b"k", b"v2").expect("write v2");
+            assert_eq!(tx.commit().expect("commit v2"), 2);
+            assert_eq!(store.version_count_for_key(b"k"), 2);
+        }
+
+        {
+            let store = MvccStore::open_persistent(&dir).expect("reopen durable store");
+            assert_eq!(store.version_count_for_key(b"k"), 2);
+            let reader = store.begin_transaction();
+            assert_eq!(reader.get(b"k").expect("read latest"), Some(b"v2".to_vec()));
+
+            let mut tx = store.begin_transaction();
+            tx.put(b"k", b"v3").expect("write v3");
+            let commit_ts = tx.commit().expect("commit v3");
+            assert!(commit_ts >= 3);
+        }
+
+        fs::remove_dir_all(dir).expect("cleanup temp dir");
     }
 }
