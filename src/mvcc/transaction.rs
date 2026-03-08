@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::RwLock;
@@ -40,6 +42,8 @@ pub struct TransactionMetrics {
     pub rolled_back: u64,
     pub write_conflicts: u64,
     pub active_transactions: usize,
+    pub recovered_keys: u64,
+    pub recovered_versions: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -68,6 +72,10 @@ struct TransactionMetricsState {
     committed: AtomicU64,
     rolled_back: AtomicU64,
     write_conflicts: AtomicU64,
+    recovered_keys: AtomicU64,
+    recovered_versions: AtomicU64,
+    #[cfg(test)]
+    crash_after_durable_commit: AtomicBool,
 }
 
 #[derive(Debug, Clone)]
@@ -110,18 +118,33 @@ impl MvccStore {
         self.inner.durable_engine.is_some()
     }
 
+    #[cfg(test)]
+    fn set_crash_after_durable_commit_for_test(&self, enabled: bool) {
+        self.inner.metrics.crash_after_durable_commit.store(enabled, Ordering::Relaxed);
+    }
+
     fn from_parts(
         data: MvccStoreData,
         durable_engine: Option<Arc<StorageEngine>>,
         initial_timestamp: u64,
     ) -> Self {
+        let recovered_keys = u64::try_from(data.versions.len()).unwrap_or(u64::MAX);
+        let recovered_versions = data
+            .versions
+            .values()
+            .map(|versions| u64::try_from(versions.len()).unwrap_or(u64::MAX))
+            .fold(0_u64, u64::saturating_add);
+        let metrics = TransactionMetricsState::default();
+        metrics.recovered_keys.store(recovered_keys, Ordering::Relaxed);
+        metrics.recovered_versions.store(recovered_versions, Ordering::Relaxed);
+
         Self {
             inner: Arc::new(MvccStoreInner {
                 oracle: TimestampOracle::new(initial_timestamp),
                 snapshots: SnapshotRegistry::default(),
                 data: RwLock::new(data),
                 durable_engine,
-                metrics: TransactionMetricsState::default(),
+                metrics,
             }),
         }
     }
@@ -158,6 +181,8 @@ impl MvccStore {
             rolled_back: self.inner.metrics.rolled_back.load(Ordering::Relaxed),
             write_conflicts: self.inner.metrics.write_conflicts.load(Ordering::Relaxed),
             active_transactions: self.active_snapshot_count(),
+            recovered_keys: self.inner.metrics.recovered_keys.load(Ordering::Relaxed),
+            recovered_versions: self.inner.metrics.recovered_versions.load(Ordering::Relaxed),
         }
     }
 
@@ -282,6 +307,13 @@ impl MvccStore {
                 }
                 return Err(err);
             }
+        }
+
+        #[cfg(test)]
+        if self.inner.durable_engine.is_some()
+            && self.inner.metrics.crash_after_durable_commit.load(Ordering::Relaxed)
+        {
+            panic!("simulated crash after durable commit");
         }
 
         trace!(commit_ts, write_count = writes.len(), "commit applied");
@@ -488,6 +520,7 @@ impl Drop for Transaction {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::path::PathBuf;
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -656,6 +689,61 @@ mod tests {
             tx.put(b"k", b"v3").expect("write v3");
             let commit_ts = tx.commit().expect("commit v3");
             assert!(commit_ts >= 3);
+        }
+
+        fs::remove_dir_all(dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn durable_store_survives_crash_before_commit_acknowledgment() {
+        let dir = test_dir("crash-before-ack");
+
+        {
+            let store = MvccStore::open_persistent(&dir).expect("open durable store");
+            store.set_crash_after_durable_commit_for_test(true);
+
+            let mut tx = store.begin_transaction();
+            tx.put(b"crash-key", b"persisted").expect("write");
+            let crashed = catch_unwind(AssertUnwindSafe(|| {
+                let _ = tx.commit();
+            }));
+            assert!(crashed.is_err());
+        }
+
+        {
+            let store = MvccStore::open_persistent(&dir).expect("reopen durable store");
+            let reader = store.begin_transaction();
+            assert_eq!(
+                reader.get(b"crash-key").expect("read after simulated crash"),
+                Some(b"persisted".to_vec())
+            );
+        }
+
+        fs::remove_dir_all(dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn durable_store_reports_recovered_metrics_after_restart() {
+        let dir = test_dir("recovered-metrics");
+
+        {
+            let store = MvccStore::open_persistent(&dir).expect("open durable store");
+
+            let mut tx = store.begin_transaction();
+            tx.put(b"m/a", b"1").expect("put a");
+            tx.commit().expect("commit a");
+
+            let mut tx = store.begin_transaction();
+            tx.put(b"m/a", b"2").expect("update a");
+            tx.put(b"m/b", b"3").expect("put b");
+            tx.commit().expect("commit second batch");
+        }
+
+        {
+            let store = MvccStore::open_persistent(&dir).expect("reopen durable store");
+            let metrics = store.metrics();
+            assert_eq!(metrics.recovered_keys, 2);
+            assert_eq!(metrics.recovered_versions, 3);
         }
 
         fs::remove_dir_all(dir).expect("cleanup temp dir");

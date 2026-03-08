@@ -44,11 +44,32 @@ Transactions read at a fixed `read_ts` and stage writes locally until commit.
 - if write set empty, returns `read_ts`
 - detects write-write conflicts:
   - for each written key, if latest committed `commit_ts > read_ts`, abort with conflict error
-- otherwise allocates `commit_ts` and appends versions
+- otherwise allocates `commit_ts`, persists durable state (durable mode), then acknowledges commit
 
 5. Rollback / drop
 - discard write buffer
 - release snapshot pin
+
+## Commit durability contract
+
+Durable mode defines two explicit points:
+
+- Durability point:
+  - committed version state is written to `StorageEngine`.
+  - after this point, committed data must survive restart.
+- Visibility / acknowledgment point:
+  - `commit()` returns success to caller.
+  - in-process metrics (`committed`) are incremented.
+
+Crash behavior:
+
+- Crash before durability point:
+  - transaction may be retried; data is not guaranteed persisted.
+- Crash after durability point but before acknowledgment:
+  - data is recovered and visible after restart.
+  - client may treat commit outcome as unknown and handle idempotently.
+- Rollback or uncommitted transaction:
+  - staged writes are never persisted and are absent after restart.
 
 ## Conflict detection
 
@@ -78,6 +99,8 @@ Pruning rule:
 - rolled_back
 - write_conflicts
 - active_transactions
+- recovered_keys
+- recovered_versions
 
 ## Durability modes
 
