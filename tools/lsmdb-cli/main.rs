@@ -47,7 +47,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ControlFlow::Continue => continue,
                 ControlFlow::Break => break,
             }
-            continue;
         }
 
         let request = request_from_sql(input);
