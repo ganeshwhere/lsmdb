@@ -5,7 +5,7 @@ use crate::sql::ast::{
     LiteralValue, OrderByExpr, SelectItem,
 };
 
-use super::logical::{LogicalFilter, LogicalLimit, LogicalPlan, LogicalScan, LogicalSort};
+use super::logical::{LogicalFilter, LogicalPlan, LogicalScan};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PhysicalPlan {
@@ -252,6 +252,7 @@ fn collect_conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::planner::{LogicalLimit, LogicalSort};
     use crate::sql::ast::SortDirection;
 
     fn scan_node() -> LogicalScan {
