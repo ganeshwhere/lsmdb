@@ -14,7 +14,7 @@ pub(crate) fn execute_delete(
     let table = catalog
         .get_table(&node.table)
         .ok_or_else(|| ExecutionError::TableNotFound(node.table.clone()))?;
-    let (_, rows) = scan_table_rows(catalog, tx, &table.name)?;
+    let (_, rows) = scan_table_rows(catalog, tx, &table.name, usize::MAX)?;
 
     let mut affected = 0_u64;
     for stored in rows {

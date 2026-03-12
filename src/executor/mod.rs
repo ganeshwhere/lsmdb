@@ -89,8 +89,59 @@ pub enum ExecutionError {
     TransactionAlreadyActive,
     #[error("DDL in explicit transaction is not supported yet")]
     DdlInTransactionUnsupported,
+    #[error("resource limit exceeded for {resource}: actual={actual}, limit={limit}")]
+    ResourceLimitExceeded { resource: &'static str, actual: usize, limit: usize },
     #[error("unsupported plan: {0}")]
     UnsupportedPlan(&'static str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutionLimits {
+    pub max_scan_rows: usize,
+    pub max_sort_rows: usize,
+    pub max_join_rows: usize,
+    pub max_query_result_rows: usize,
+}
+
+impl Default for ExecutionLimits {
+    fn default() -> Self {
+        Self {
+            max_scan_rows: usize::MAX,
+            max_sort_rows: usize::MAX,
+            max_join_rows: usize::MAX,
+            max_query_result_rows: usize::MAX,
+        }
+    }
+}
+
+impl ExecutionLimits {
+    fn ensure_within(
+        &self,
+        resource: &'static str,
+        actual: usize,
+        limit: usize,
+    ) -> Result<(), ExecutionError> {
+        if actual > limit {
+            return Err(ExecutionError::ResourceLimitExceeded { resource, actual, limit });
+        }
+        Ok(())
+    }
+
+    fn ensure_scan_rows(&self, actual: usize) -> Result<(), ExecutionError> {
+        self.ensure_within("scan rows", actual, self.max_scan_rows)
+    }
+
+    fn ensure_sort_rows(&self, actual: usize) -> Result<(), ExecutionError> {
+        self.ensure_within("sort rows", actual, self.max_sort_rows)
+    }
+
+    fn ensure_join_rows(&self, actual: usize) -> Result<(), ExecutionError> {
+        self.ensure_within("join rows", actual, self.max_join_rows)
+    }
+
+    fn ensure_query_result_rows(&self, actual: usize) -> Result<(), ExecutionError> {
+        self.ensure_within("query result rows", actual, self.max_query_result_rows)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -125,12 +176,21 @@ pub(crate) struct StoredRow {
 pub struct ExecutionSession<'a> {
     catalog: &'a Catalog,
     store: &'a MvccStore,
+    limits: ExecutionLimits,
     active_tx: Option<Transaction>,
 }
 
 impl<'a> ExecutionSession<'a> {
     pub fn new(catalog: &'a Catalog, store: &'a MvccStore) -> Self {
-        Self { catalog, store, active_tx: None }
+        Self::with_limits(catalog, store, ExecutionLimits::default())
+    }
+
+    pub fn with_limits(
+        catalog: &'a Catalog,
+        store: &'a MvccStore,
+        limits: ExecutionLimits,
+    ) -> Self {
+        Self { catalog, store, limits, active_tx: None }
     }
 
     pub fn has_active_transaction(&self) -> bool {
@@ -186,9 +246,14 @@ impl<'a> ExecutionSession<'a> {
             | PhysicalPlan::Project(_)
             | PhysicalPlan::Sort(_)
             | PhysicalPlan::Limit(_)
-            | PhysicalPlan::Join(_) => self
-                .with_read_tx(|catalog, tx| execute_query_plan(catalog, tx, plan))
-                .map(|rows| ExecutionResult::Query(rows.into_query_result())),
+            | PhysicalPlan::Join(_) => {
+                let limits = self.limits;
+                self.with_read_tx(|catalog, tx| execute_query_plan(catalog, tx, plan, &limits))
+                    .and_then(|rows| {
+                        limits.ensure_query_result_rows(rows.rows.len())?;
+                        Ok(ExecutionResult::Query(rows.into_query_result()))
+                    })
+            }
         }
     }
 
@@ -233,30 +298,31 @@ fn execute_query_plan(
     catalog: &Catalog,
     tx: &mut Transaction,
     plan: &PhysicalPlan,
+    limits: &ExecutionLimits,
 ) -> Result<RowSet, ExecutionError> {
     match plan {
-        PhysicalPlan::SeqScan(node) => scan::execute_seq_scan(catalog, tx, node),
+        PhysicalPlan::SeqScan(node) => scan::execute_seq_scan(catalog, tx, node, limits),
         PhysicalPlan::PrimaryKeyScan(node) => scan::execute_primary_key_scan(catalog, tx, node),
         PhysicalPlan::Filter(node) => {
-            let input = execute_query_plan(catalog, tx, &node.input)?;
+            let input = execute_query_plan(catalog, tx, &node.input, limits)?;
             filter::apply_filter(input, &node.predicate)
         }
         PhysicalPlan::Project(node) => {
-            let input = execute_query_plan(catalog, tx, &node.input)?;
+            let input = execute_query_plan(catalog, tx, &node.input, limits)?;
             projection::apply_projection(input, &node.projection)
         }
         PhysicalPlan::Sort(node) => {
-            let input = execute_query_plan(catalog, tx, &node.input)?;
-            projection::apply_sort(input, &node.order_by)
+            let input = execute_query_plan(catalog, tx, &node.input, limits)?;
+            projection::apply_sort(input, &node.order_by, limits)
         }
         PhysicalPlan::Limit(node) => {
-            let input = execute_query_plan(catalog, tx, &node.input)?;
+            let input = execute_query_plan(catalog, tx, &node.input, limits)?;
             projection::apply_limit(input, node.limit)
         }
         PhysicalPlan::Join(node) => {
-            let left = execute_query_plan(catalog, tx, &node.left)?;
-            let right = execute_query_plan(catalog, tx, &node.right)?;
-            join::execute_join(left, right, &node.on)
+            let left = execute_query_plan(catalog, tx, &node.left, limits)?;
+            let right = execute_query_plan(catalog, tx, &node.right, limits)?;
+            join::execute_join(left, right, &node.on, limits)
         }
         _ => Err(ExecutionError::UnsupportedPlan("non-query node used in query execution path")),
     }

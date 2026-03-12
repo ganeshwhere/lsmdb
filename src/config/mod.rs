@@ -5,6 +5,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::server::ServerLimits;
 use crate::storage::compaction::{
     CompactionStrategy, LeveledCompactionConfig, TieredCompactionConfig,
 };
@@ -32,6 +33,7 @@ pub enum ConfigError {
 #[serde(default, deny_unknown_fields)]
 pub struct LsmdbConfig {
     pub storage: StorageConfig,
+    pub server: ServerConfig,
     pub wal: WalConfig,
     pub sstable: SstableConfig,
     pub compaction: CompactionConfig,
@@ -41,6 +43,7 @@ impl Default for LsmdbConfig {
     fn default() -> Self {
         Self {
             storage: StorageConfig::default(),
+            server: ServerConfig::default(),
             wal: WalConfig::default(),
             sstable: SstableConfig::default(),
             compaction: CompactionConfig::default(),
@@ -65,6 +68,37 @@ impl Default for StorageConfig {
             memtable_arena_block_size_bytes: defaults.memtable_arena_block_size_bytes,
             flush_poll_interval_ms: defaults.flush_poll_interval.as_millis() as u64,
             flush_timeout_ms: defaults.flush_timeout.as_millis() as u64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServerConfig {
+    pub max_concurrent_connections: usize,
+    pub max_in_flight_requests_per_connection: usize,
+    pub max_request_bytes: usize,
+    pub max_statements_per_request: usize,
+    pub max_memory_intensive_requests: usize,
+    pub max_scan_rows: usize,
+    pub max_sort_rows: usize,
+    pub max_join_rows: usize,
+    pub max_query_result_rows: usize,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        let defaults = ServerLimits::default();
+        Self {
+            max_concurrent_connections: defaults.max_concurrent_connections,
+            max_in_flight_requests_per_connection: defaults.max_in_flight_requests_per_connection,
+            max_request_bytes: defaults.max_request_bytes,
+            max_statements_per_request: defaults.max_statements_per_request,
+            max_memory_intensive_requests: defaults.max_memory_intensive_requests,
+            max_scan_rows: defaults.max_scan_rows,
+            max_sort_rows: defaults.max_sort_rows,
+            max_join_rows: defaults.max_join_rows,
+            max_query_result_rows: defaults.max_query_result_rows,
         }
     }
 }
@@ -216,6 +250,7 @@ impl Default for TieredConfig {
 pub struct RuntimeConfig {
     pub storage_engine: StorageEngineOptions,
     pub compaction_strategy: CompactionStrategy,
+    pub server_limits: ServerLimits,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,6 +274,15 @@ pub struct StartupDiagnostics {
     pub memtable_arena_block_size_bytes: usize,
     pub flush_poll_interval_ms: u64,
     pub flush_timeout_ms: u64,
+    pub server_max_concurrent_connections: usize,
+    pub server_max_in_flight_requests_per_connection: usize,
+    pub server_max_request_bytes: usize,
+    pub server_max_statements_per_request: usize,
+    pub server_max_memory_intensive_requests: usize,
+    pub server_max_scan_rows: usize,
+    pub server_max_sort_rows: usize,
+    pub server_max_join_rows: usize,
+    pub server_max_query_result_rows: usize,
     pub wal_segment_size_bytes: u64,
     pub wal_sync_mode: SyncModeConfig,
     pub sstable_data_block_size_bytes: usize,
@@ -258,6 +302,21 @@ impl StartupDiagnostics {
             ),
             format!("storage.flush_poll_interval_ms={}", self.flush_poll_interval_ms),
             format!("storage.flush_timeout_ms={}", self.flush_timeout_ms),
+            format!("server.max_concurrent_connections={}", self.server_max_concurrent_connections),
+            format!(
+                "server.max_in_flight_requests_per_connection={}",
+                self.server_max_in_flight_requests_per_connection
+            ),
+            format!("server.max_request_bytes={}", self.server_max_request_bytes),
+            format!("server.max_statements_per_request={}", self.server_max_statements_per_request),
+            format!(
+                "server.max_memory_intensive_requests={}",
+                self.server_max_memory_intensive_requests
+            ),
+            format!("server.max_scan_rows={}", self.server_max_scan_rows),
+            format!("server.max_sort_rows={}", self.server_max_sort_rows),
+            format!("server.max_join_rows={}", self.server_max_join_rows),
+            format!("server.max_query_result_rows={}", self.server_max_query_result_rows),
             format!("wal.segment_size_bytes={}", self.wal_segment_size_bytes),
             format!("wal.sync_mode={}", self.wal_sync_mode.as_str()),
             format!("sstable.data_block_size_bytes={}", self.sstable_data_block_size_bytes),
@@ -340,6 +399,33 @@ impl LsmdbConfig {
                 "must be >= storage.flush_poll_interval_ms",
             ));
         }
+        if self.server.max_concurrent_connections == 0 {
+            return Err(invalid("server.max_concurrent_connections", "must be > 0"));
+        }
+        if self.server.max_in_flight_requests_per_connection == 0 {
+            return Err(invalid("server.max_in_flight_requests_per_connection", "must be > 0"));
+        }
+        if self.server.max_request_bytes == 0 {
+            return Err(invalid("server.max_request_bytes", "must be > 0"));
+        }
+        if self.server.max_statements_per_request == 0 {
+            return Err(invalid("server.max_statements_per_request", "must be > 0"));
+        }
+        if self.server.max_memory_intensive_requests == 0 {
+            return Err(invalid("server.max_memory_intensive_requests", "must be > 0"));
+        }
+        if self.server.max_scan_rows == 0 {
+            return Err(invalid("server.max_scan_rows", "must be > 0"));
+        }
+        if self.server.max_sort_rows == 0 {
+            return Err(invalid("server.max_sort_rows", "must be > 0"));
+        }
+        if self.server.max_join_rows == 0 {
+            return Err(invalid("server.max_join_rows", "must be > 0"));
+        }
+        if self.server.max_query_result_rows == 0 {
+            return Err(invalid("server.max_query_result_rows", "must be > 0"));
+        }
         if self.wal.segment_size_bytes < MIN_WAL_SEGMENT_SIZE_BYTES {
             return Err(invalid(
                 "wal.segment_size_bytes",
@@ -399,6 +485,19 @@ impl LsmdbConfig {
             memtable_arena_block_size_bytes: storage.memtable_arena_block_size_bytes,
             flush_poll_interval_ms: storage.flush_poll_interval.as_millis() as u64,
             flush_timeout_ms: storage.flush_timeout.as_millis() as u64,
+            server_max_concurrent_connections: runtime.server_limits.max_concurrent_connections,
+            server_max_in_flight_requests_per_connection: runtime
+                .server_limits
+                .max_in_flight_requests_per_connection,
+            server_max_request_bytes: runtime.server_limits.max_request_bytes,
+            server_max_statements_per_request: runtime.server_limits.max_statements_per_request,
+            server_max_memory_intensive_requests: runtime
+                .server_limits
+                .max_memory_intensive_requests,
+            server_max_scan_rows: runtime.server_limits.max_scan_rows,
+            server_max_sort_rows: runtime.server_limits.max_sort_rows,
+            server_max_join_rows: runtime.server_limits.max_join_rows,
+            server_max_query_result_rows: runtime.server_limits.max_query_result_rows,
             wal_segment_size_bytes: storage.wal_options.segment_size_bytes,
             wal_sync_mode: SyncModeConfig::from(storage.wal_options.sync_mode),
             sstable_data_block_size_bytes: storage.sstable_builder_options.data_block_size_bytes,
@@ -415,6 +514,7 @@ impl LsmdbConfig {
         Ok(RuntimeConfig {
             storage_engine: self.to_storage_engine_options_unchecked(),
             compaction_strategy: self.to_compaction_strategy_unchecked(),
+            server_limits: self.to_server_limits_unchecked(),
         })
     }
 
@@ -426,6 +526,11 @@ impl LsmdbConfig {
     pub fn to_compaction_strategy(&self) -> Result<CompactionStrategy, ConfigError> {
         self.validate()?;
         Ok(self.to_compaction_strategy_unchecked())
+    }
+
+    pub fn to_server_limits(&self) -> Result<ServerLimits, ConfigError> {
+        self.validate()?;
+        Ok(self.to_server_limits_unchecked())
     }
 
     fn to_storage_engine_options_unchecked(&self) -> StorageEngineOptions {
@@ -463,6 +568,22 @@ impl LsmdbConfig {
                 min_tier_size_bytes: self.compaction.tiered.min_tier_size_bytes,
                 output_level: self.compaction.tiered.output_level,
             }),
+        }
+    }
+
+    fn to_server_limits_unchecked(&self) -> ServerLimits {
+        ServerLimits {
+            max_concurrent_connections: self.server.max_concurrent_connections,
+            max_in_flight_requests_per_connection: self
+                .server
+                .max_in_flight_requests_per_connection,
+            max_request_bytes: self.server.max_request_bytes,
+            max_statements_per_request: self.server.max_statements_per_request,
+            max_memory_intensive_requests: self.server.max_memory_intensive_requests,
+            max_scan_rows: self.server.max_scan_rows,
+            max_sort_rows: self.server.max_sort_rows,
+            max_join_rows: self.server.max_join_rows,
+            max_query_result_rows: self.server.max_query_result_rows,
         }
     }
 }
@@ -508,6 +629,7 @@ mod tests {
 
         let runtime = config.to_runtime_config().expect("runtime config");
         assert!(runtime.storage_engine.memtable_size_bytes > 0);
+        assert!(runtime.server_limits.max_concurrent_connections > 0);
         match runtime.compaction_strategy {
             CompactionStrategy::Leveled(_) => {}
             CompactionStrategy::Tiered(_) => panic!("expected leveled strategy by default"),
@@ -522,6 +644,17 @@ mod tests {
             memtable_arena_block_size_bytes = 16384
             flush_poll_interval_ms = 15
             flush_timeout_ms = 2000
+
+            [server]
+            max_concurrent_connections = 32
+            max_in_flight_requests_per_connection = 1
+            max_request_bytes = 65536
+            max_statements_per_request = 8
+            max_memory_intensive_requests = 4
+            max_scan_rows = 2048
+            max_sort_rows = 1024
+            max_join_rows = 512
+            max_query_result_rows = 256
 
             [wal]
             segment_size_bytes = 16777216
@@ -543,7 +676,11 @@ mod tests {
 
         let config = LsmdbConfig::from_toml_str(raw).expect("parse custom config");
         let options = config.to_storage_engine_options().expect("storage options");
+        let server_limits = config.to_server_limits().expect("server limits");
         assert_eq!(options.memtable_size_bytes, 1_048_576);
+        assert_eq!(server_limits.max_concurrent_connections, 32);
+        assert_eq!(server_limits.max_request_bytes, 65_536);
+        assert_eq!(server_limits.max_join_rows, 512);
         assert_eq!(options.wal_options.segment_size_bytes, 16_777_216);
         assert_eq!(options.wal_options.sync_mode, SyncMode::Always);
         assert_eq!(options.sstable_builder_options.data_block_size_bytes, 8192);
@@ -624,6 +761,19 @@ mod tests {
     }
 
     #[test]
+    fn rejects_zero_server_connection_limit() {
+        let raw = r#"
+            [server]
+            max_concurrent_connections = 0
+        "#;
+
+        let err = LsmdbConfig::from_toml_str(raw).expect_err("invalid server limit");
+        assert!(
+            matches!(err, ConfigError::InvalidValue { field, .. } if field == "server.max_concurrent_connections")
+        );
+    }
+
+    #[test]
     fn emits_startup_diagnostics_for_runtime_config() {
         let raw = r#"
             [storage]
@@ -631,6 +781,17 @@ mod tests {
             memtable_arena_block_size_bytes = 4096
             flush_poll_interval_ms = 25
             flush_timeout_ms = 100
+
+            [server]
+            max_concurrent_connections = 24
+            max_in_flight_requests_per_connection = 1
+            max_request_bytes = 32768
+            max_statements_per_request = 4
+            max_memory_intensive_requests = 2
+            max_scan_rows = 128
+            max_sort_rows = 64
+            max_join_rows = 32
+            max_query_result_rows = 16
 
             [wal]
             segment_size_bytes = 4096
@@ -646,10 +807,14 @@ mod tests {
         assert_eq!(diagnostics.memtable_arena_block_size_bytes, 4096);
         assert_eq!(diagnostics.flush_poll_interval_ms, 25);
         assert_eq!(diagnostics.flush_timeout_ms, 100);
+        assert_eq!(diagnostics.server_max_concurrent_connections, 24);
+        assert_eq!(diagnostics.server_max_request_bytes, 32_768);
+        assert_eq!(diagnostics.server_max_query_result_rows, 16);
         assert_eq!(diagnostics.wal_segment_size_bytes, 4096);
         assert_eq!(diagnostics.wal_sync_mode, SyncModeConfig::OnCommit);
 
         let lines = diagnostics.as_key_value_lines();
+        assert!(lines.iter().any(|line| line == "server.max_concurrent_connections=24"));
         assert!(lines.iter().any(|line| line == "compaction.strategy=leveled"));
         assert!(lines.iter().any(|line| line.starts_with("sstable.bloom_bits_per_key=")));
     }

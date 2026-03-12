@@ -246,6 +246,40 @@ impl MvccStore {
         rows
     }
 
+    pub fn scan_prefix_at_limited(
+        &self,
+        prefix: &[u8],
+        read_ts: u64,
+        max_rows: usize,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let data = self.inner.data.read();
+        let mut rows = Vec::new();
+
+        for (key, versions) in &data.versions {
+            if !key.starts_with(prefix) {
+                continue;
+            }
+
+            for version in versions.iter().rev() {
+                if version.commit_ts > read_ts {
+                    continue;
+                }
+
+                if let Some(value) = &version.value {
+                    rows.push((key.clone(), value.clone()));
+                    if rows.len() >= max_rows {
+                        rows.sort_by(|a, b| a.0.cmp(&b.0));
+                        return rows;
+                    }
+                }
+                break;
+            }
+        }
+
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    }
+
     pub fn scan_prefix_latest(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         self.scan_prefix_at(prefix, self.current_timestamp())
     }
@@ -437,6 +471,42 @@ impl Transaction {
         let read_ts = self.read_ts()?;
         let mut visible =
             self.store.scan_prefix_at(prefix, read_ts).into_iter().collect::<BTreeMap<_, _>>();
+
+        for (key, value) in &self.writes {
+            if !key.starts_with(prefix) {
+                continue;
+            }
+
+            match value {
+                Some(value) => {
+                    visible.insert(key.clone(), value.clone());
+                }
+                None => {
+                    visible.remove(key);
+                }
+            }
+        }
+
+        Ok(visible.into_iter().collect())
+    }
+
+    pub fn scan_prefix_limited(
+        &self,
+        prefix: &[u8],
+        max_rows: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TransactionError> {
+        if self.closed {
+            return Err(TransactionError::Closed);
+        }
+
+        let read_ts = self.read_ts()?;
+        let write_overlap = self.writes.keys().filter(|key| key.starts_with(prefix)).count();
+        let fetch_limit = max_rows.saturating_add(write_overlap).saturating_add(1);
+        let mut visible = self
+            .store
+            .scan_prefix_at_limited(prefix, read_ts, fetch_limit)
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
 
         for (key, value) in &self.writes {
             if !key.starts_with(prefix) {

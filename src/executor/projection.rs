@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use crate::sql::ast::{Expr, OrderByExpr, SelectItem, SortDirection};
 
 use super::filter::evaluate_expr;
-use super::{ExecutionError, RowSet, ScalarValue};
+use super::{ExecutionError, ExecutionLimits, RowSet, ScalarValue};
 
 pub(crate) fn apply_projection(
     input: RowSet,
@@ -42,12 +42,14 @@ pub(crate) fn apply_projection(
 pub(crate) fn apply_sort(
     input: RowSet,
     order_by: &[OrderByExpr],
+    limits: &ExecutionLimits,
 ) -> Result<RowSet, ExecutionError> {
     if order_by.is_empty() {
         return Ok(input);
     }
 
     let RowSet { columns, rows, table_name } = input;
+    limits.ensure_sort_rows(rows.len())?;
 
     let mut keyed = rows
         .into_iter()
@@ -194,6 +196,7 @@ mod tests {
                 expr: Expr::Identifier("id".to_string()),
                 direction: SortDirection::Desc,
             }],
+            &ExecutionLimits::default(),
         )
         .expect("sort");
 

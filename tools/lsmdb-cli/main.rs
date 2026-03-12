@@ -242,6 +242,13 @@ fn render_response(response: ResponseFrame) {
                 println!("accepting_connections: {}", status.accepting_connections);
                 println!("active_connections: {}", status.active_connections);
                 println!("total_connections: {}", status.total_connections);
+                println!("rejected_connections: {}", status.rejected_connections);
+                println!("busy_requests: {}", status.busy_requests);
+                println!("resource_limit_requests: {}", status.resource_limit_requests);
+                println!(
+                    "active_memory_intensive_requests: {}",
+                    status.active_memory_intensive_requests
+                );
                 println!("mvcc_started: {}", status.mvcc_started);
                 println!("mvcc_committed: {}", status.mvcc_committed);
                 println!("mvcc_rolled_back: {}", status.mvcc_rolled_back);
@@ -249,8 +256,13 @@ fn render_response(response: ResponseFrame) {
                 println!("mvcc_active_transactions: {}", status.mvcc_active_transactions);
             }
         },
-        ResponseFrame::Err(message) => {
-            eprintln!("Error: {message}");
+        ResponseFrame::Err(error) => {
+            eprintln!(
+                "Error [{}{}]: {}",
+                error.code.as_str(),
+                if error.retryable { ", retryable" } else { "" },
+                error.message
+            );
         }
     }
 }
