@@ -49,7 +49,63 @@ pub struct RequestFrame {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResponseFrame {
     Ok(ResponsePayload),
-    Err(String),
+    Err(ErrorPayload),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ErrorCode {
+    InvalidRequest = 1,
+    Parse = 2,
+    Validation = 3,
+    Planner = 4,
+    Execution = 5,
+    Busy = 6,
+    ResourceLimit = 7,
+}
+
+impl TryFrom<u8> for ErrorCode {
+    type Error = ProtocolError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(ErrorCode::InvalidRequest),
+            2 => Ok(ErrorCode::Parse),
+            3 => Ok(ErrorCode::Validation),
+            4 => Ok(ErrorCode::Planner),
+            5 => Ok(ErrorCode::Execution),
+            6 => Ok(ErrorCode::Busy),
+            7 => Ok(ErrorCode::ResourceLimit),
+            other => Err(ProtocolError::InvalidFrame(format!("unknown error code byte: {other}"))),
+        }
+    }
+}
+
+impl ErrorCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ErrorCode::InvalidRequest => "INVALID_REQUEST",
+            ErrorCode::Parse => "PARSE",
+            ErrorCode::Validation => "VALIDATION",
+            ErrorCode::Planner => "PLANNER",
+            ErrorCode::Execution => "EXECUTION",
+            ErrorCode::Busy => "BUSY",
+            ErrorCode::ResourceLimit => "RESOURCE_LIMIT",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorPayload {
+    pub code: ErrorCode,
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl ErrorPayload {
+    pub fn new(code: ErrorCode, message: impl Into<String>, retryable: bool) -> Self {
+        Self { code, message: message.into(), retryable }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -89,6 +145,10 @@ pub struct AdminStatusPayload {
     pub accepting_connections: bool,
     pub active_connections: u64,
     pub total_connections: u64,
+    pub rejected_connections: u64,
+    pub busy_requests: u64,
+    pub resource_limit_requests: u64,
+    pub active_memory_intensive_requests: u64,
     pub mvcc_started: u64,
     pub mvcc_committed: u64,
     pub mvcc_rolled_back: u64,
@@ -110,6 +170,8 @@ pub enum ProtocolError {
     Io(#[from] std::io::Error),
     #[error("invalid frame: {0}")]
     InvalidFrame(String),
+    #[error("frame too large: length={length}, max={max}")]
+    FrameTooLarge { length: usize, max: usize },
     #[error("utf8 decode error: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
 }
@@ -117,7 +179,17 @@ pub enum ProtocolError {
 pub async fn read_request<R: AsyncRead + Unpin>(
     reader: &mut R,
 ) -> Result<Option<RequestFrame>, ProtocolError> {
-    let Some(body) = read_frame(reader).await? else {
+    let Some(body) = read_frame(reader, None).await? else {
+        return Ok(None);
+    };
+    decode_request(&body).map(Some)
+}
+
+pub async fn read_request_with_limit<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    max_body_bytes: usize,
+) -> Result<Option<RequestFrame>, ProtocolError> {
+    let Some(body) = read_frame(reader, Some(max_body_bytes)).await? else {
         return Ok(None);
     };
     decode_request(&body).map(Some)
@@ -134,7 +206,7 @@ pub async fn write_request<W: AsyncWrite + Unpin>(
 pub async fn read_response<R: AsyncRead + Unpin>(
     reader: &mut R,
 ) -> Result<Option<ResponseFrame>, ProtocolError> {
-    let Some(body) = read_frame(reader).await? else {
+    let Some(body) = read_frame(reader, None).await? else {
         return Ok(None);
     };
     decode_response(&body).map(Some)
@@ -211,6 +283,7 @@ fn hex_char(value: u8) -> char {
 
 async fn read_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
+    max_body_bytes: Option<usize>,
 ) -> Result<Option<Vec<u8>>, ProtocolError> {
     let mut len_buf = [0_u8; 4];
     match reader.read_exact(&mut len_buf).await {
@@ -224,6 +297,18 @@ async fn read_frame<R: AsyncRead + Unpin>(
         return Err(ProtocolError::InvalidFrame(
             "frame length must be greater than zero".to_string(),
         ));
+    }
+    if let Some(max_body_bytes) = max_body_bytes {
+        if length > max_body_bytes {
+            let mut remaining = length;
+            let mut discard_buf = [0_u8; 4096];
+            while remaining > 0 {
+                let chunk_len = remaining.min(discard_buf.len());
+                reader.read_exact(&mut discard_buf[..chunk_len]).await?;
+                remaining -= chunk_len;
+            }
+            return Err(ProtocolError::FrameTooLarge { length, max: max_body_bytes });
+        }
     }
 
     let mut body = vec![0_u8; length];
@@ -267,9 +352,11 @@ fn encode_response(response: &ResponseFrame) -> Result<Vec<u8>, ProtocolError> {
             body.push(0_u8);
             encode_payload(payload, &mut body)?;
         }
-        ResponseFrame::Err(message) => {
+        ResponseFrame::Err(error) => {
             body.push(1_u8);
-            write_len_prefixed_bytes(&mut body, message.as_bytes())?;
+            body.push(error.code as u8);
+            body.push(u8::from(error.retryable));
+            write_len_prefixed_bytes(&mut body, error.message.as_bytes())?;
         }
     }
     Ok(body)
@@ -293,13 +380,15 @@ fn decode_response(body: &[u8]) -> Result<ResponseFrame, ProtocolError> {
         }
         1 => {
             let mut cursor = Cursor::new(payload);
+            let code = ErrorCode::try_from(read_u8(&mut cursor)?)?;
+            let retryable = read_bool(&mut cursor)?;
             let message = read_len_prefixed_string(&mut cursor)?;
             if (cursor.position() as usize) != payload.len() {
                 return Err(ProtocolError::InvalidFrame(
                     "error payload has trailing bytes".to_string(),
                 ));
             }
-            Ok(ResponseFrame::Err(message))
+            Ok(ResponseFrame::Err(ErrorPayload { code, message, retryable }))
         }
         other => Err(ProtocolError::InvalidFrame(format!("unknown response status byte: {other}"))),
     }
@@ -351,6 +440,10 @@ fn encode_payload(payload: &ResponsePayload, out: &mut Vec<u8>) -> Result<(), Pr
             out.push(u8::from(status.accepting_connections));
             out.extend(status.active_connections.to_be_bytes());
             out.extend(status.total_connections.to_be_bytes());
+            out.extend(status.rejected_connections.to_be_bytes());
+            out.extend(status.busy_requests.to_be_bytes());
+            out.extend(status.resource_limit_requests.to_be_bytes());
+            out.extend(status.active_memory_intensive_requests.to_be_bytes());
             out.extend(status.mvcc_started.to_be_bytes());
             out.extend(status.mvcc_committed.to_be_bytes());
             out.extend(status.mvcc_rolled_back.to_be_bytes());
@@ -422,6 +515,10 @@ fn decode_payload(cursor: &mut Cursor<&[u8]>) -> Result<ResponsePayload, Protoco
             let accepting_connections = read_bool(cursor)?;
             let active_connections = read_u64(cursor)?;
             let total_connections = read_u64(cursor)?;
+            let rejected_connections = read_u64(cursor)?;
+            let busy_requests = read_u64(cursor)?;
+            let resource_limit_requests = read_u64(cursor)?;
+            let active_memory_intensive_requests = read_u64(cursor)?;
             let mvcc_started = read_u64(cursor)?;
             let mvcc_committed = read_u64(cursor)?;
             let mvcc_rolled_back = read_u64(cursor)?;
@@ -434,6 +531,10 @@ fn decode_payload(cursor: &mut Cursor<&[u8]>) -> Result<ResponsePayload, Protoco
                 accepting_connections,
                 active_connections,
                 total_connections,
+                rejected_connections,
+                busy_requests,
+                resource_limit_requests,
+                active_memory_intensive_requests,
                 mvcc_started,
                 mvcc_committed,
                 mvcc_rolled_back,
@@ -540,6 +641,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn error_response_round_trip() {
+        let response = ResponseFrame::Err(ErrorPayload {
+            code: ErrorCode::Busy,
+            message: "server busy: retry later".to_string(),
+            retryable: true,
+        });
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        write_response(&mut client, &response).await.expect("write response");
+        let decoded = read_response(&mut server).await.expect("read response").expect("response");
+        assert_eq!(decoded, response);
+    }
+
+    #[tokio::test]
     async fn explain_payload_round_trip() {
         let response =
             ResponseFrame::Ok(ResponsePayload::ExplainPlan("PrimaryKeyScan(users)".to_string()));
@@ -570,6 +684,10 @@ mod tests {
             accepting_connections: true,
             active_connections: 1,
             total_connections: 4,
+            rejected_connections: 2,
+            busy_requests: 3,
+            resource_limit_requests: 1,
+            active_memory_intensive_requests: 0,
             mvcc_started: 12,
             mvcc_committed: 9,
             mvcc_rolled_back: 2,
@@ -580,5 +698,15 @@ mod tests {
         write_response(&mut client, &response).await.expect("write response");
         let decoded = read_response(&mut server).await.expect("read response").expect("response");
         assert_eq!(decoded, response);
+    }
+
+    #[tokio::test]
+    async fn request_frame_limit_rejects_oversized_body() {
+        let request = RequestFrame { request_type: RequestType::Query, sql: "SELECT 1".repeat(64) };
+
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        write_request(&mut client, &request).await.expect("write request");
+        let err = read_request_with_limit(&mut server, 16).await.expect_err("frame too large");
+        assert!(matches!(err, ProtocolError::FrameTooLarge { .. }));
     }
 }

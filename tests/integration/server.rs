@@ -5,9 +5,10 @@ use std::sync::Arc;
 use lsmdb::catalog::Catalog;
 use lsmdb::mvcc::MvccStore;
 use lsmdb::server::{
-    AdminStatusPayload, HealthPayload, PROTOCOL_VERSION, QueryPayload, ReadinessPayload,
-    RequestFrame, RequestType, ResponseFrame, ResponsePayload, TransactionState, read_response,
-    start_server, write_request,
+    AdminStatusPayload, ErrorCode, ErrorPayload, HealthPayload, PROTOCOL_VERSION, QueryPayload,
+    ReadinessPayload, RequestFrame, RequestType, ResponseFrame, ResponsePayload, ServerLimits,
+    ServerOptions, TransactionState, read_response, start_server, start_server_with_options,
+    write_request,
 };
 use tokio::net::TcpStream;
 
@@ -48,6 +49,13 @@ fn response_to_admin_status(response: ResponseFrame) -> AdminStatusPayload {
     match response {
         ResponseFrame::Ok(ResponsePayload::AdminStatus(payload)) => payload,
         other => panic!("expected admin status payload, got {other:?}"),
+    }
+}
+
+fn response_to_error(response: ResponseFrame) -> ErrorPayload {
+    match response {
+        ResponseFrame::Err(payload) => payload,
+        other => panic!("expected error payload, got {other:?}"),
     }
 }
 
@@ -275,11 +283,199 @@ async fn server_exposes_health_readiness_and_admin_status() {
     assert!(admin.accepting_connections);
     assert!(admin.total_connections >= 1);
     assert!(admin.active_connections >= 1);
+    assert_eq!(admin.rejected_connections, 0);
+    assert_eq!(admin.busy_requests, 0);
+    assert_eq!(admin.resource_limit_requests, 0);
+    assert_eq!(admin.active_memory_intensive_requests, 0);
     assert_eq!(admin.mvcc_started, 0);
     assert_eq!(admin.mvcc_committed, 0);
     assert_eq!(admin.mvcc_rolled_back, 0);
     assert_eq!(admin.mvcc_write_conflicts, 0);
     assert_eq!(admin.mvcc_active_transactions, 0);
+
+    server.shutdown().await.expect("shutdown server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_rejects_connections_above_limit_and_keeps_existing_connection_responsive() {
+    let store = Arc::new(MvccStore::new());
+    let catalog = Arc::new(Catalog::open((*store).clone()).expect("open catalog"));
+    let options = ServerOptions {
+        limits: ServerLimits { max_concurrent_connections: 1, ..ServerLimits::default() },
+    };
+
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("parse socket addr");
+    let server =
+        start_server_with_options(bind_addr, Arc::clone(&catalog), Arc::clone(&store), options)
+            .await
+            .expect("start server");
+    let server_addr = server.local_addr();
+
+    let mut first = TcpStream::connect(server_addr).await.expect("connect first client");
+    let mut second = TcpStream::connect(server_addr).await.expect("connect second client");
+
+    let rejected =
+        read_response(&mut second).await.expect("read busy response").expect("busy response");
+    let error = response_to_error(rejected);
+    assert_eq!(error.code, ErrorCode::Busy);
+    assert!(error.retryable);
+    assert!(error.message.contains("max concurrent connections"));
+
+    let health = response_to_health(
+        send_request(
+            &mut first,
+            RequestFrame { request_type: RequestType::Health, sql: String::new() },
+        )
+        .await,
+    );
+    assert!(health.ok);
+
+    let admin = response_to_admin_status(
+        send_request(
+            &mut first,
+            RequestFrame { request_type: RequestType::AdminStatus, sql: String::new() },
+        )
+        .await,
+    );
+    assert_eq!(admin.rejected_connections, 1);
+
+    server.shutdown().await.expect("shutdown server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_rejects_oversized_request_frames_with_resource_limit_error() {
+    let store = Arc::new(MvccStore::new());
+    let catalog = Arc::new(Catalog::open((*store).clone()).expect("open catalog"));
+    let options =
+        ServerOptions { limits: ServerLimits { max_request_bytes: 32, ..ServerLimits::default() } };
+
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("parse socket addr");
+    let server =
+        start_server_with_options(bind_addr, Arc::clone(&catalog), Arc::clone(&store), options)
+            .await
+            .expect("start server");
+    let server_addr = server.local_addr();
+
+    let mut client = TcpStream::connect(server_addr).await.expect("connect client");
+    let error = response_to_error(
+        send_request(
+            &mut client,
+            RequestFrame {
+                request_type: RequestType::Query,
+                sql: "SELECT 1 FROM some_really_long_table_name_that_exceeds_the_limit".to_string(),
+            },
+        )
+        .await,
+    );
+    assert_eq!(error.code, ErrorCode::ResourceLimit);
+    assert!(!error.retryable);
+    assert!(error.message.contains("request frame too large"));
+
+    server.shutdown().await.expect("shutdown server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_enforces_scan_and_sort_limits() {
+    let store = Arc::new(MvccStore::new());
+    let catalog = Arc::new(Catalog::open((*store).clone()).expect("open catalog"));
+    let options = ServerOptions {
+        limits: ServerLimits {
+            max_scan_rows: 2,
+            max_sort_rows: 2,
+            max_query_result_rows: 2,
+            ..ServerLimits::default()
+        },
+    };
+
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("parse socket addr");
+    let server =
+        start_server_with_options(bind_addr, Arc::clone(&catalog), Arc::clone(&store), options)
+            .await
+            .expect("start server");
+    let server_addr = server.local_addr();
+
+    let mut client = TcpStream::connect(server_addr).await.expect("connect client");
+    let create_response = send_request(
+        &mut client,
+        RequestFrame {
+            request_type: RequestType::Query,
+            sql: "CREATE TABLE users (id BIGINT NOT NULL, email TEXT NOT NULL, PRIMARY KEY (id))"
+                .to_string(),
+        },
+    )
+    .await;
+    assert!(matches!(create_response, ResponseFrame::Ok(ResponsePayload::AffectedRows(0))));
+
+    for id in 1..=3 {
+        let insert = send_request(
+            &mut client,
+            RequestFrame {
+                request_type: RequestType::Query,
+                sql: format!("INSERT INTO users (id, email) VALUES ({id}, 'user{id}@x.com')"),
+            },
+        )
+        .await;
+        assert!(matches!(insert, ResponseFrame::Ok(ResponsePayload::AffectedRows(1))));
+    }
+
+    let scan_error = response_to_error(
+        send_request(
+            &mut client,
+            RequestFrame {
+                request_type: RequestType::Query,
+                sql: "SELECT id, email FROM users".to_string(),
+            },
+        )
+        .await,
+    );
+    assert_eq!(scan_error.code, ErrorCode::ResourceLimit);
+    assert!(scan_error.message.contains("scan rows"));
+
+    let sort_error = response_to_error(
+        send_request(
+            &mut client,
+            RequestFrame {
+                request_type: RequestType::Query,
+                sql: "SELECT id FROM users ORDER BY id DESC".to_string(),
+            },
+        )
+        .await,
+    );
+    assert_eq!(sort_error.code, ErrorCode::ResourceLimit);
+    assert!(sort_error.message.contains("scan rows") || sort_error.message.contains("sort rows"));
+
+    server.shutdown().await.expect("shutdown server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_enforces_statement_count_limit() {
+    let store = Arc::new(MvccStore::new());
+    let catalog = Arc::new(Catalog::open((*store).clone()).expect("open catalog"));
+    let options = ServerOptions {
+        limits: ServerLimits { max_statements_per_request: 1, ..ServerLimits::default() },
+    };
+
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("parse socket addr");
+    let server =
+        start_server_with_options(bind_addr, Arc::clone(&catalog), Arc::clone(&store), options)
+            .await
+            .expect("start server");
+    let server_addr = server.local_addr();
+
+    let mut client = TcpStream::connect(server_addr).await.expect("connect client");
+
+    let error = response_to_error(
+        send_request(
+            &mut client,
+            RequestFrame {
+                request_type: RequestType::Query,
+                sql: "BEGIN ISOLATION LEVEL SNAPSHOT; COMMIT".to_string(),
+            },
+        )
+        .await,
+    );
+    assert_eq!(error.code, ErrorCode::ResourceLimit);
+    assert!(error.message.contains("statements"));
 
     server.shutdown().await.expect("shutdown server");
 }

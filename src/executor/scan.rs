@@ -4,17 +4,19 @@ use crate::mvcc::Transaction;
 use crate::planner::{PrimaryKeyScanNode, SeqScanNode};
 
 use super::{
-    ExecutionError, Row, RowSet, StoredRow, build_row_key, coerce_scalar_for_column, decode_row,
-    literal_to_scalar, table_rows_prefix,
+    ExecutionError, ExecutionLimits, Row, RowSet, StoredRow, build_row_key,
+    coerce_scalar_for_column, decode_row, literal_to_scalar, table_rows_prefix,
 };
 
 pub(crate) fn execute_seq_scan(
     catalog: &Catalog,
     tx: &Transaction,
     node: &SeqScanNode,
+    limits: &ExecutionLimits,
 ) -> Result<RowSet, ExecutionError> {
-    let (_, stored_rows) = scan_table_rows(catalog, tx, &node.table)?;
+    let (_, stored_rows) = scan_table_rows(catalog, tx, &node.table, limits.max_scan_rows)?;
     let rows = stored_rows.into_iter().map(|stored| stored.values).collect::<Vec<_>>();
+    limits.ensure_scan_rows(rows.len())?;
 
     Ok(RowSet { columns: node.output_columns.clone(), rows, table_name: Some(node.table.clone()) })
 }
@@ -53,10 +55,23 @@ pub(crate) fn scan_table_rows(
     catalog: &Catalog,
     tx: &Transaction,
     table_name: &str,
+    max_rows: usize,
 ) -> Result<(TableDescriptor, Vec<StoredRow>), ExecutionError> {
     let table = get_table(catalog, table_name)?;
     let prefix = table_rows_prefix(&table.name);
-    let rows = tx.scan_prefix(&prefix)?;
+    let rows = if max_rows == usize::MAX {
+        tx.scan_prefix(&prefix)?
+    } else {
+        tx.scan_prefix_limited(&prefix, max_rows)?
+    };
+
+    if rows.len() > max_rows {
+        return Err(ExecutionError::ResourceLimitExceeded {
+            resource: "scan rows",
+            actual: rows.len(),
+            limit: max_rows,
+        });
+    }
 
     let decoded_rows = rows
         .into_iter()
