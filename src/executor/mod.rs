@@ -1,5 +1,6 @@
 pub mod delete;
 pub mod filter;
+pub mod governance;
 pub mod insert;
 pub mod join;
 pub mod projection;
@@ -18,6 +19,8 @@ use crate::mvcc::{MvccStore, Transaction, TransactionError};
 use crate::planner::PhysicalPlan;
 use crate::sql::ast::LiteralValue;
 
+use self::governance::ExecutionGovernance;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScalarValue {
     Integer(i32),
@@ -33,6 +36,19 @@ pub enum ScalarValue {
 impl ScalarValue {
     pub fn is_null(&self) -> bool {
         matches!(self, ScalarValue::Null)
+    }
+
+    fn estimated_query_bytes(&self) -> usize {
+        match self {
+            ScalarValue::Integer(_) => std::mem::size_of::<i32>(),
+            ScalarValue::BigInt(_) => std::mem::size_of::<i64>(),
+            ScalarValue::Float(_) => std::mem::size_of::<f64>(),
+            ScalarValue::Text(value) => value.len(),
+            ScalarValue::Boolean(_) => 1,
+            ScalarValue::Blob(value) => value.len(),
+            ScalarValue::Timestamp(_) => std::mem::size_of::<i64>(),
+            ScalarValue::Null => 0,
+        }
     }
 }
 
@@ -91,6 +107,10 @@ pub enum ExecutionError {
     DdlInTransactionUnsupported,
     #[error("resource limit exceeded for {resource}: actual={actual}, limit={limit}")]
     ResourceLimitExceeded { resource: &'static str, actual: usize, limit: usize },
+    #[error("statement timed out after {timeout_ms} ms")]
+    StatementTimedOut { timeout_ms: u64 },
+    #[error("statement canceled: {reason}")]
+    StatementCanceled { reason: &'static str },
     #[error("unsupported plan: {0}")]
     UnsupportedPlan(&'static str),
 }
@@ -101,6 +121,7 @@ pub struct ExecutionLimits {
     pub max_sort_rows: usize,
     pub max_join_rows: usize,
     pub max_query_result_rows: usize,
+    pub max_query_result_bytes: usize,
 }
 
 impl Default for ExecutionLimits {
@@ -110,6 +131,7 @@ impl Default for ExecutionLimits {
             max_sort_rows: usize::MAX,
             max_join_rows: usize::MAX,
             max_query_result_rows: usize::MAX,
+            max_query_result_bytes: usize::MAX,
         }
     }
 }
@@ -142,6 +164,10 @@ impl ExecutionLimits {
     fn ensure_query_result_rows(&self, actual: usize) -> Result<(), ExecutionError> {
         self.ensure_within("query result rows", actual, self.max_query_result_rows)
     }
+
+    fn ensure_query_result_bytes(&self, actual: usize) -> Result<(), ExecutionError> {
+        self.ensure_within("query result bytes", actual, self.max_query_result_bytes)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -152,18 +178,29 @@ pub(crate) struct RowSet {
 }
 
 impl RowSet {
-    pub(crate) fn into_query_result(self) -> QueryResult {
+    pub(crate) fn into_query_result(
+        self,
+        context: &ExecutionContext<'_>,
+    ) -> Result<QueryResult, ExecutionError> {
         let mut materialized_rows = Vec::with_capacity(self.rows.len());
+        let mut materialized_bytes = 0_usize;
         for row in self.rows {
+            context.checkpoint()?;
             let values = self
                 .columns
                 .iter()
                 .map(|column| row.get(column).cloned().unwrap_or(ScalarValue::Null))
                 .collect::<Vec<_>>();
+            for value in &values {
+                materialized_bytes =
+                    materialized_bytes.saturating_add(value.estimated_query_bytes());
+                context.limits.ensure_query_result_bytes(materialized_bytes)?;
+            }
             materialized_rows.push(values);
+            context.limits.ensure_query_result_rows(materialized_rows.len())?;
         }
 
-        QueryResult { columns: self.columns, rows: materialized_rows }
+        Ok(QueryResult { columns: self.columns, rows: materialized_rows })
     }
 }
 
@@ -198,6 +235,17 @@ impl<'a> ExecutionSession<'a> {
     }
 
     pub fn execute_plan(&mut self, plan: &PhysicalPlan) -> Result<ExecutionResult, ExecutionError> {
+        self.execute_plan_with_governance(plan, &ExecutionGovernance::default())
+    }
+
+    pub fn execute_plan_with_governance(
+        &mut self,
+        plan: &PhysicalPlan,
+        governance: &ExecutionGovernance,
+    ) -> Result<ExecutionResult, ExecutionError> {
+        let limits = self.limits;
+        let context = ExecutionContext { limits: &limits, governance };
+        context.checkpoint()?;
         match plan {
             PhysicalPlan::Begin(_) => {
                 if self.active_tx.is_some() {
@@ -232,13 +280,13 @@ impl<'a> ExecutionSession<'a> {
                 Ok(ExecutionResult::AffectedRows(0))
             }
             PhysicalPlan::Insert(node) => self
-                .with_write_tx(|catalog, tx| insert::execute_insert(catalog, tx, node))
+                .with_write_tx(|catalog, tx| insert::execute_insert(catalog, tx, node, &context))
                 .map(ExecutionResult::AffectedRows),
             PhysicalPlan::Update(node) => self
-                .with_write_tx(|catalog, tx| update::execute_update(catalog, tx, node))
+                .with_write_tx(|catalog, tx| update::execute_update(catalog, tx, node, &context))
                 .map(ExecutionResult::AffectedRows),
             PhysicalPlan::Delete(node) => self
-                .with_write_tx(|catalog, tx| delete::execute_delete(catalog, tx, node))
+                .with_write_tx(|catalog, tx| delete::execute_delete(catalog, tx, node, &context))
                 .map(ExecutionResult::AffectedRows),
             PhysicalPlan::SeqScan(_)
             | PhysicalPlan::PrimaryKeyScan(_)
@@ -246,14 +294,18 @@ impl<'a> ExecutionSession<'a> {
             | PhysicalPlan::Project(_)
             | PhysicalPlan::Sort(_)
             | PhysicalPlan::Limit(_)
-            | PhysicalPlan::Join(_) => {
-                let limits = self.limits;
-                self.with_read_tx(|catalog, tx| execute_query_plan(catalog, tx, plan, &limits))
-                    .and_then(|rows| {
-                        limits.ensure_query_result_rows(rows.rows.len())?;
-                        Ok(ExecutionResult::Query(rows.into_query_result()))
-                    })
-            }
+            | PhysicalPlan::Join(_) => self
+                .with_read_tx(|catalog, tx| execute_query_plan(catalog, tx, plan, &context))
+                .and_then(|rows| Ok(ExecutionResult::Query(rows.into_query_result(&context)?))),
+        }
+    }
+
+    pub fn abort_active_transaction(&mut self) -> bool {
+        if let Some(mut tx) = self.active_tx.take() {
+            tx.rollback();
+            true
+        } else {
+            false
         }
     }
 
@@ -298,34 +350,73 @@ fn execute_query_plan(
     catalog: &Catalog,
     tx: &mut Transaction,
     plan: &PhysicalPlan,
-    limits: &ExecutionLimits,
+    context: &ExecutionContext<'_>,
 ) -> Result<RowSet, ExecutionError> {
+    context.checkpoint()?;
     match plan {
-        PhysicalPlan::SeqScan(node) => scan::execute_seq_scan(catalog, tx, node, limits),
-        PhysicalPlan::PrimaryKeyScan(node) => scan::execute_primary_key_scan(catalog, tx, node),
+        PhysicalPlan::SeqScan(node) => scan::execute_seq_scan(catalog, tx, node, context),
+        PhysicalPlan::PrimaryKeyScan(node) => {
+            scan::execute_primary_key_scan(catalog, tx, node, context)
+        }
         PhysicalPlan::Filter(node) => {
-            let input = execute_query_plan(catalog, tx, &node.input, limits)?;
-            filter::apply_filter(input, &node.predicate)
+            let input = execute_query_plan(catalog, tx, &node.input, context)?;
+            filter::apply_filter(input, &node.predicate, context)
         }
         PhysicalPlan::Project(node) => {
-            let input = execute_query_plan(catalog, tx, &node.input, limits)?;
-            projection::apply_projection(input, &node.projection)
+            let input = execute_query_plan(catalog, tx, &node.input, context)?;
+            projection::apply_projection(input, &node.projection, context)
         }
         PhysicalPlan::Sort(node) => {
-            let input = execute_query_plan(catalog, tx, &node.input, limits)?;
-            projection::apply_sort(input, &node.order_by, limits)
+            let input = execute_query_plan(catalog, tx, &node.input, context)?;
+            projection::apply_sort(input, &node.order_by, context)
         }
         PhysicalPlan::Limit(node) => {
-            let input = execute_query_plan(catalog, tx, &node.input, limits)?;
-            projection::apply_limit(input, node.limit)
+            let input = execute_query_plan(catalog, tx, &node.input, context)?;
+            projection::apply_limit(input, node.limit, context)
         }
         PhysicalPlan::Join(node) => {
-            let left = execute_query_plan(catalog, tx, &node.left, limits)?;
-            let right = execute_query_plan(catalog, tx, &node.right, limits)?;
-            join::execute_join(left, right, &node.on, limits)
+            let left = execute_query_plan(catalog, tx, &node.left, context)?;
+            let right = execute_query_plan(catalog, tx, &node.right, context)?;
+            join::execute_join(left, right, &node.on, context)
         }
         _ => Err(ExecutionError::UnsupportedPlan("non-query node used in query execution path")),
     }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ExecutionContext<'a> {
+    pub(crate) limits: &'a ExecutionLimits,
+    pub(crate) governance: &'a ExecutionGovernance,
+}
+
+impl<'a> ExecutionContext<'a> {
+    pub(crate) fn checkpoint(&self) -> Result<(), ExecutionError> {
+        self.governance.checkpoint()
+    }
+}
+
+pub(crate) fn staged_value_for_key(
+    tx: &Transaction,
+    staged: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    key: &[u8],
+) -> Result<Option<Vec<u8>>, ExecutionError> {
+    if let Some(value) = staged.get(key) {
+        return Ok(value.clone());
+    }
+    Ok(tx.get(key)?)
+}
+
+pub(crate) fn apply_staged_writes(
+    tx: &mut Transaction,
+    staged: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+) -> Result<(), ExecutionError> {
+    for (key, value) in staged {
+        match value {
+            Some(value) => tx.put(&key, &value)?,
+            None => tx.delete(&key)?,
+        }
+    }
+    Ok(())
 }
 
 fn create_statement_to_descriptor(

@@ -1,8 +1,10 @@
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use parking_lot::Mutex;
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
@@ -10,6 +12,7 @@ use tokio::task::JoinHandle;
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::catalog::Catalog;
+use crate::executor::governance::{ExecutionGovernance, StatementCancellation};
 use crate::executor::{ExecutionError, ExecutionLimits, ExecutionSession};
 use crate::mvcc::MvccStore;
 use crate::planner::{PhysicalPlan, PlannerError, plan_statement};
@@ -17,9 +20,10 @@ use crate::sql::parser::{ParseError, parse_sql};
 use crate::sql::validator::{ValidationError, validate_statement};
 
 use super::protocol::{
-    AdminStatusPayload, ErrorCode, ErrorPayload, HealthPayload, PROTOCOL_VERSION, ProtocolError,
-    ReadinessPayload, RequestFrame, RequestType, ResponseFrame, ResponsePayload,
-    payload_from_execution_result, read_request_with_limit, write_response,
+    ActiveStatementPayload, ActiveStatementsPayload, AdminStatusPayload, ErrorCode, ErrorPayload,
+    HealthPayload, PROTOCOL_VERSION, ProtocolError, ReadinessPayload, RequestFrame, RequestType,
+    ResponseFrame, ResponsePayload, StatementCancellationPayload, payload_from_execution_result,
+    read_request_with_limit, write_response,
 };
 
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -30,11 +34,14 @@ pub struct ServerLimits {
     pub max_in_flight_requests_per_connection: usize,
     pub max_request_bytes: usize,
     pub max_statements_per_request: usize,
+    pub statement_timeout_ms: Option<u64>,
     pub max_memory_intensive_requests: usize,
     pub max_scan_rows: usize,
     pub max_sort_rows: usize,
     pub max_join_rows: usize,
     pub max_query_result_rows: usize,
+    pub max_query_result_bytes: usize,
+    pub max_concurrent_queries_per_identity: Option<usize>,
 }
 
 impl Default for ServerLimits {
@@ -44,11 +51,14 @@ impl Default for ServerLimits {
             max_in_flight_requests_per_connection: 1,
             max_request_bytes: 256 * 1024,
             max_statements_per_request: 16,
+            statement_timeout_ms: None,
             max_memory_intensive_requests: 8,
             max_scan_rows: 10_000,
             max_sort_rows: 10_000,
             max_join_rows: 10_000,
             max_query_result_rows: 10_000,
+            max_query_result_bytes: 4 * 1024 * 1024,
+            max_concurrent_queries_per_identity: None,
         }
     }
 }
@@ -65,12 +75,25 @@ impl ServerLimits {
             ("max_sort_rows", self.max_sort_rows),
             ("max_join_rows", self.max_join_rows),
             ("max_query_result_rows", self.max_query_result_rows),
+            ("max_query_result_bytes", self.max_query_result_bytes),
         ] {
             if value == 0 {
                 return Err(ServerError::InvalidConfiguration(format!(
                     "server limit '{field}' must be > 0"
                 )));
             }
+        }
+
+        if matches!(self.statement_timeout_ms, Some(0)) {
+            return Err(ServerError::InvalidConfiguration(
+                "server limit 'statement_timeout_ms' must be > 0 when set".to_string(),
+            ));
+        }
+        if matches!(self.max_concurrent_queries_per_identity, Some(0)) {
+            return Err(ServerError::InvalidConfiguration(
+                "server limit 'max_concurrent_queries_per_identity' must be > 0 when set"
+                    .to_string(),
+            ));
         }
 
         Ok(())
@@ -82,6 +105,7 @@ impl ServerLimits {
             max_sort_rows: self.max_sort_rows,
             max_join_rows: self.max_join_rows,
             max_query_result_rows: self.max_query_result_rows,
+            max_query_result_bytes: self.max_query_result_bytes,
         }
     }
 }
@@ -100,7 +124,13 @@ struct ServerRuntimeState {
     rejected_connections: AtomicU64,
     busy_requests: AtomicU64,
     resource_limit_requests: AtomicU64,
+    quota_rejections: AtomicU64,
+    timed_out_requests: AtomicU64,
+    canceled_requests: AtomicU64,
     active_memory_intensive_requests: AtomicU64,
+    next_statement_id: AtomicU64,
+    active_statements: Mutex<BTreeMap<u64, ActiveStatementEntry>>,
+    identity_query_counts: Mutex<HashMap<String, usize>>,
     limits: ServerLimits,
     connection_slots: Arc<Semaphore>,
     memory_intensive_slots: Arc<Semaphore>,
@@ -116,7 +146,13 @@ impl ServerRuntimeState {
             rejected_connections: AtomicU64::new(0),
             busy_requests: AtomicU64::new(0),
             resource_limit_requests: AtomicU64::new(0),
+            quota_rejections: AtomicU64::new(0),
+            timed_out_requests: AtomicU64::new(0),
+            canceled_requests: AtomicU64::new(0),
             active_memory_intensive_requests: AtomicU64::new(0),
+            next_statement_id: AtomicU64::new(1),
+            active_statements: Mutex::new(BTreeMap::new()),
+            identity_query_counts: Mutex::new(HashMap::new()),
             limits: options.limits,
             connection_slots: Arc::new(Semaphore::new(options.limits.max_concurrent_connections)),
             memory_intensive_slots: Arc::new(Semaphore::new(
@@ -143,6 +179,145 @@ impl ServerRuntimeState {
 
     fn record_resource_limit_request(&self) {
         self.resource_limit_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_quota_rejection(&self) {
+        self.quota_rejections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_timed_out_request(&self) {
+        self.timed_out_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_canceled_request(&self) {
+        self.canceled_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn begin_statement(
+        self: &Arc<Self>,
+        connection_id: u64,
+        identity: &str,
+        request_type: RequestType,
+        sql: &str,
+    ) -> Result<StatementExecutionGuard, RequestError> {
+        if let Some(limit) = self.limits.max_concurrent_queries_per_identity {
+            let mut counts = self.identity_query_counts.lock();
+            let current = counts.get(identity).copied().unwrap_or(0);
+            if current >= limit {
+                drop(counts);
+                return Err(RequestError::Quota(format!(
+                    "identity '{identity}' exceeded concurrent query quota ({limit})"
+                )));
+            }
+            counts.insert(identity.to_string(), current + 1);
+        }
+
+        let statement_id = self.next_statement_id.fetch_add(1, Ordering::Relaxed);
+        let cancellation = StatementCancellation::new();
+        let entry = ActiveStatementEntry {
+            statement_id,
+            connection_id,
+            identity: identity.to_string(),
+            request_type,
+            sql_preview: sql_preview(sql),
+            started_at: Instant::now(),
+            cancellation: cancellation.clone(),
+        };
+        self.active_statements.lock().insert(statement_id, entry);
+
+        Ok(StatementExecutionGuard {
+            runtime_state: Arc::clone(self),
+            statement_id,
+            identity: identity.to_string(),
+            cancellation,
+        })
+    }
+
+    fn finish_statement(&self, statement_id: u64, identity: &str) {
+        self.active_statements.lock().remove(&statement_id);
+        if self.limits.max_concurrent_queries_per_identity.is_some() {
+            let mut counts = self.identity_query_counts.lock();
+            if let Some(current) = counts.get_mut(identity) {
+                if *current <= 1 {
+                    counts.remove(identity);
+                } else {
+                    *current -= 1;
+                }
+            }
+        }
+    }
+
+    fn active_statement_payloads(&self) -> Vec<ActiveStatementPayload> {
+        self.active_statements
+            .lock()
+            .values()
+            .map(|entry| ActiveStatementPayload {
+                statement_id: entry.statement_id,
+                connection_id: entry.connection_id,
+                identity: entry.identity.clone(),
+                request_type: request_type_name(entry.request_type).to_string(),
+                runtime_ms: duration_to_millis(entry.started_at.elapsed()),
+                cancel_requested: entry.cancellation.reason().is_some(),
+                sql_preview: entry.sql_preview.clone(),
+            })
+            .collect()
+    }
+
+    fn cancel_statement(&self, statement_id: u64) -> StatementCancellationPayload {
+        let Some(statement) = self.active_statements.lock().get(&statement_id).cloned() else {
+            return StatementCancellationPayload {
+                statement_id,
+                accepted: false,
+                status: "statement not found".to_string(),
+            };
+        };
+
+        let accepted = statement.cancellation.cancel();
+        StatementCancellationPayload {
+            statement_id,
+            accepted,
+            status: if accepted {
+                "cancellation signaled".to_string()
+            } else {
+                "cancellation was already requested".to_string()
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ActiveStatementEntry {
+    statement_id: u64,
+    connection_id: u64,
+    identity: String,
+    request_type: RequestType,
+    sql_preview: String,
+    started_at: Instant,
+    cancellation: StatementCancellation,
+}
+
+#[derive(Debug)]
+struct StatementExecutionGuard {
+    runtime_state: Arc<ServerRuntimeState>,
+    statement_id: u64,
+    identity: String,
+    cancellation: StatementCancellation,
+}
+
+impl StatementExecutionGuard {
+    fn governance(&self, statement_timeout_ms: Option<u64>) -> ExecutionGovernance {
+        let mut governance =
+            ExecutionGovernance::default().with_cancellation(self.cancellation.clone());
+        if let Some(timeout_ms) = statement_timeout_ms {
+            governance = governance.with_timeout(Duration::from_millis(timeout_ms));
+        }
+        governance
+    }
+}
+
+impl Drop for StatementExecutionGuard {
+    fn drop(&mut self) {
+        self.runtime_state.finish_statement(self.statement_id, &self.identity);
     }
 }
 
@@ -192,11 +367,13 @@ impl Drop for MemoryIntensiveRequestGuard {
 #[derive(Debug)]
 struct ConnectionContext {
     request_slots: Arc<Semaphore>,
+    connection_id: u64,
+    identity: String,
 }
 
 impl ConnectionContext {
-    fn new(limit: usize) -> Self {
-        Self { request_slots: Arc::new(Semaphore::new(limit)) }
+    fn new(limit: usize, connection_id: u64, identity: String) -> Self {
+        Self { request_slots: Arc::new(Semaphore::new(limit)), connection_id, identity }
     }
 
     fn try_acquire_request_slot(&self) -> Option<ConnectionRequestGuard> {
@@ -228,6 +405,8 @@ enum RequestError {
     Busy(String),
     #[error("resource limit exceeded: {0}")]
     ResourceLimit(String),
+    #[error("quota exceeded: {0}")]
+    Quota(String),
     #[error("parse error: {0}")]
     Parse(#[from] ParseError),
     #[error("validation error: {0}")]
@@ -248,6 +427,7 @@ impl RequestError {
             RequestError::ResourceLimit(message) => {
                 ErrorPayload::new(ErrorCode::ResourceLimit, message, false)
             }
+            RequestError::Quota(message) => ErrorPayload::new(ErrorCode::Quota, message, true),
             RequestError::Parse(error) => {
                 ErrorPayload::new(ErrorCode::Parse, error.to_string(), false)
             }
@@ -260,6 +440,12 @@ impl RequestError {
             RequestError::Execution(error) => match error {
                 ExecutionError::ResourceLimitExceeded { .. } => {
                     ErrorPayload::new(ErrorCode::ResourceLimit, error.to_string(), false)
+                }
+                ExecutionError::StatementTimedOut { .. } => {
+                    ErrorPayload::new(ErrorCode::Timeout, error.to_string(), false)
+                }
+                ExecutionError::StatementCanceled { .. } => {
+                    ErrorPayload::new(ErrorCode::Canceled, error.to_string(), false)
                 }
                 _ => ErrorPayload::new(ErrorCode::Execution, error.to_string(), false),
             },
@@ -340,6 +526,7 @@ async fn run_accept_loop(
             accept_result = listener.accept() => {
                 let (mut stream, peer_addr) = accept_result?;
                 let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+                let identity = peer_addr.ip().to_string();
                 runtime_state.total_connections.fetch_add(1, Ordering::Relaxed);
                 let Some(connection_permit) = runtime_state.try_acquire_connection() else {
                     runtime_state.record_rejected_connection();
@@ -372,6 +559,8 @@ async fn run_accept_loop(
                         store,
                         runtime_state,
                         connection_permit,
+                        connection_id,
+                        identity,
                     )
                     .await
                     {
@@ -391,10 +580,15 @@ async fn handle_connection(
     store: Arc<MvccStore>,
     runtime_state: Arc<ServerRuntimeState>,
     connection_permit: OwnedSemaphorePermit,
+    connection_id: u64,
+    identity: String,
 ) -> Result<(), ServerError> {
     let _connection_guard = ConnectionGuard::new(Arc::clone(&runtime_state), connection_permit);
-    let connection_context =
-        ConnectionContext::new(runtime_state.limits.max_in_flight_requests_per_connection);
+    let connection_context = ConnectionContext::new(
+        runtime_state.limits.max_in_flight_requests_per_connection,
+        connection_id,
+        identity,
+    );
     let mut session = ExecutionSession::with_limits(
         catalog.as_ref(),
         store.as_ref(),
@@ -446,24 +640,39 @@ async fn handle_connection(
         let sql_len = request.sql.len();
         debug!(request_type = ?request_type, sql_len, "received request frame");
 
-        let response =
-            match execute_request(&mut session, &catalog, &store, &runtime_state, request) {
-                Ok(payload) => {
-                    debug!(request_type = ?request_type, "request handled successfully");
-                    ResponseFrame::Ok(payload)
+        let response = match execute_request(
+            &mut session,
+            &catalog,
+            &store,
+            &runtime_state,
+            &connection_context,
+            request,
+        ) {
+            Ok(payload) => {
+                debug!(request_type = ?request_type, "request handled successfully");
+                ResponseFrame::Ok(payload)
+            }
+            Err(err) => {
+                warn!(request_type = ?request_type, error = %err, "request failed");
+                let payload = err.into_error_payload();
+                if payload.code == ErrorCode::Busy {
+                    runtime_state.record_busy_request();
                 }
-                Err(err) => {
-                    warn!(request_type = ?request_type, error = %err, "request failed");
-                    let payload = err.into_error_payload();
-                    if payload.code == ErrorCode::Busy {
-                        runtime_state.record_busy_request();
-                    }
-                    if payload.code == ErrorCode::ResourceLimit {
-                        runtime_state.record_resource_limit_request();
-                    }
-                    ResponseFrame::Err(payload)
+                if payload.code == ErrorCode::ResourceLimit {
+                    runtime_state.record_resource_limit_request();
                 }
-            };
+                if payload.code == ErrorCode::Quota {
+                    runtime_state.record_quota_rejection();
+                }
+                if payload.code == ErrorCode::Timeout {
+                    runtime_state.record_timed_out_request();
+                }
+                if payload.code == ErrorCode::Canceled {
+                    runtime_state.record_canceled_request();
+                }
+                ResponseFrame::Err(payload)
+            }
+        };
 
         if let Err(err) = write_response(&mut stream, &response).await {
             error!(error = %err, "failed to write response");
@@ -477,6 +686,7 @@ fn execute_request(
     catalog: &Catalog,
     store: &MvccStore,
     runtime_state: &Arc<ServerRuntimeState>,
+    connection_context: &ConnectionContext,
     request: RequestFrame,
 ) -> Result<super::protocol::ResponsePayload, RequestError> {
     debug!(request_type = ?request.request_type, "executing request");
@@ -487,17 +697,60 @@ fn execute_request(
                     "query request requires non-empty SQL payload".to_string(),
                 ));
             }
-            execute_sql(session, catalog, runtime_state, &request.sql)
+            let statement = runtime_state.begin_statement(
+                connection_context.connection_id,
+                &connection_context.identity,
+                RequestType::Query,
+                &request.sql,
+            )?;
+            execute_sql(
+                session,
+                catalog,
+                runtime_state,
+                &request.sql,
+                &statement.governance(runtime_state.limits.statement_timeout_ms),
+            )
         }
-        RequestType::Begin => {
-            execute_sql(session, catalog, runtime_state, "BEGIN ISOLATION LEVEL SNAPSHOT")
+        RequestType::Begin => execute_sql(
+            session,
+            catalog,
+            runtime_state,
+            "BEGIN ISOLATION LEVEL SNAPSHOT",
+            &ExecutionGovernance::default(),
+        ),
+        RequestType::Commit => {
+            execute_sql(session, catalog, runtime_state, "COMMIT", &ExecutionGovernance::default())
         }
-        RequestType::Commit => execute_sql(session, catalog, runtime_state, "COMMIT"),
-        RequestType::Rollback => execute_sql(session, catalog, runtime_state, "ROLLBACK"),
-        RequestType::Explain => explain_sql(catalog, runtime_state, &request.sql),
+        RequestType::Rollback => execute_sql(
+            session,
+            catalog,
+            runtime_state,
+            "ROLLBACK",
+            &ExecutionGovernance::default(),
+        ),
+        RequestType::Explain => {
+            let statement = runtime_state.begin_statement(
+                connection_context.connection_id,
+                &connection_context.identity,
+                RequestType::Explain,
+                &request.sql,
+            )?;
+            explain_sql(
+                catalog,
+                runtime_state,
+                &request.sql,
+                &statement.governance(runtime_state.limits.statement_timeout_ms),
+            )
+        }
         RequestType::Health => Ok(health_payload()),
         RequestType::Readiness => Ok(readiness_payload(runtime_state)),
         RequestType::AdminStatus => Ok(admin_status_payload(store, runtime_state.as_ref())),
+        RequestType::ActiveStatements => {
+            Ok(ResponsePayload::ActiveStatements(ActiveStatementsPayload {
+                statements: runtime_state.active_statement_payloads(),
+            }))
+        }
+        RequestType::CancelStatement => cancel_statement(runtime_state, &request.sql),
     }
 }
 
@@ -506,7 +759,9 @@ fn execute_sql(
     catalog: &Catalog,
     runtime_state: &Arc<ServerRuntimeState>,
     sql: &str,
+    governance: &ExecutionGovernance,
 ) -> Result<super::protocol::ResponsePayload, RequestError> {
+    governance.checkpoint()?;
     let statements = parse_sql(sql)?;
     if statements.len() > runtime_state.limits.max_statements_per_request {
         return Err(RequestError::ResourceLimit(format!(
@@ -518,10 +773,24 @@ fn execute_sql(
     let mut last_result = None;
 
     for statement in statements {
+        governance.checkpoint()?;
         validate_statement(catalog, &statement)?;
+        governance.checkpoint()?;
         let plan = plan_statement(catalog, &statement)?;
         let _memory_guard = acquire_memory_intensive_guard(runtime_state, &plan)?;
-        let result = session.execute_plan(&plan)?;
+        let result = match session.execute_plan_with_governance(&plan, governance) {
+            Ok(result) => result,
+            Err(err) => {
+                if matches!(
+                    err,
+                    ExecutionError::StatementTimedOut { .. }
+                        | ExecutionError::StatementCanceled { .. }
+                ) {
+                    session.abort_active_transaction();
+                }
+                return Err(RequestError::Execution(err));
+            }
+        };
         last_result = Some(result);
     }
 
@@ -535,7 +804,9 @@ fn explain_sql(
     catalog: &Catalog,
     runtime_state: &Arc<ServerRuntimeState>,
     sql: &str,
+    governance: &ExecutionGovernance,
 ) -> Result<ResponsePayload, RequestError> {
+    governance.checkpoint()?;
     if sql.trim().is_empty() {
         return Err(RequestError::InvalidRequest(
             "explain request requires non-empty SQL payload".to_string(),
@@ -558,7 +829,9 @@ fn explain_sql(
 
     let mut rendered = Vec::new();
     for (index, statement) in statements.into_iter().enumerate() {
+        governance.checkpoint()?;
         validate_statement(catalog, &statement)?;
+        governance.checkpoint()?;
         let plan = plan_statement(catalog, &statement)?;
         rendered.push(format!("Statement {}:\n{plan:#?}", index + 1));
     }
@@ -568,6 +841,18 @@ fn explain_sql(
 
 fn health_payload() -> ResponsePayload {
     ResponsePayload::Health(HealthPayload { ok: true, status: "ok".to_string() })
+}
+
+fn cancel_statement(
+    runtime_state: &Arc<ServerRuntimeState>,
+    statement_id: &str,
+) -> Result<ResponsePayload, RequestError> {
+    let statement_id = statement_id.trim().parse::<u64>().map_err(|_| {
+        RequestError::InvalidRequest(
+            "cancel request requires a numeric statement id in the SQL payload".to_string(),
+        )
+    })?;
+    Ok(ResponsePayload::StatementCancellation(runtime_state.cancel_statement(statement_id)))
 }
 
 fn readiness_payload(runtime_state: &Arc<ServerRuntimeState>) -> ResponsePayload {
@@ -616,6 +901,11 @@ fn admin_status_payload(store: &MvccStore, runtime_state: &ServerRuntimeState) -
         rejected_connections: runtime_state.rejected_connections.load(Ordering::Relaxed),
         busy_requests: runtime_state.busy_requests.load(Ordering::Relaxed),
         resource_limit_requests: runtime_state.resource_limit_requests.load(Ordering::Relaxed),
+        quota_rejections: runtime_state.quota_rejections.load(Ordering::Relaxed),
+        timed_out_requests: runtime_state.timed_out_requests.load(Ordering::Relaxed),
+        canceled_requests: runtime_state.canceled_requests.load(Ordering::Relaxed),
+        active_statements: u64::try_from(runtime_state.active_statements.lock().len())
+            .unwrap_or(u64::MAX),
         active_memory_intensive_requests: runtime_state
             .active_memory_intensive_requests
             .load(Ordering::Relaxed),
@@ -625,4 +915,35 @@ fn admin_status_payload(store: &MvccStore, runtime_state: &ServerRuntimeState) -
         mvcc_write_conflicts: metrics.write_conflicts,
         mvcc_active_transactions: u64::try_from(metrics.active_transactions).unwrap_or(u64::MAX),
     })
+}
+
+fn request_type_name(request_type: RequestType) -> &'static str {
+    match request_type {
+        RequestType::Query => "QUERY",
+        RequestType::Begin => "BEGIN",
+        RequestType::Commit => "COMMIT",
+        RequestType::Rollback => "ROLLBACK",
+        RequestType::Explain => "EXPLAIN",
+        RequestType::Health => "HEALTH",
+        RequestType::Readiness => "READINESS",
+        RequestType::AdminStatus => "ADMIN_STATUS",
+        RequestType::ActiveStatements => "ACTIVE_STATEMENTS",
+        RequestType::CancelStatement => "CANCEL_STATEMENT",
+    }
+}
+
+fn sql_preview(sql: &str) -> String {
+    const MAX_PREVIEW_CHARS: usize = 160;
+
+    let mut preview = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    if preview.chars().count() > MAX_PREVIEW_CHARS {
+        preview = preview.chars().take(MAX_PREVIEW_CHARS).collect::<String>();
+        preview.push_str("...");
+    }
+    preview
+}
+
+fn duration_to_millis(duration: Duration) -> u64 {
+    let millis = duration.as_millis();
+    u64::try_from(millis).unwrap_or(u64::MAX)
 }

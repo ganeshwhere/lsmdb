@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Connected to lsmdb server at {addr}");
     println!(
-        "Type SQL to execute. Meta commands: \\help, \\q, \\timing, \\explain <sql>, \\health, \\ready, \\status"
+        "Type SQL to execute. Meta commands: \\help, \\q, \\timing, \\explain <sql>, \\health, \\ready, \\status, \\queries, \\cancel <id>"
     );
 
     let mut timing_enabled = false;
@@ -181,6 +181,45 @@ async fn handle_meta_command(
         return Ok(ControlFlow::Continue);
     }
 
+    if input == "\\queries" {
+        let start = Instant::now();
+        let response = send_request(
+            stream,
+            RequestFrame { request_type: RequestType::ActiveStatements, sql: String::new() },
+        )
+        .await?;
+        let elapsed = start.elapsed();
+        render_response(response);
+        if *timing_enabled {
+            println!("Time: {:.3} ms", elapsed.as_secs_f64() * 1000.0);
+        }
+        return Ok(ControlFlow::Continue);
+    }
+
+    if let Some(statement_id) = input.strip_prefix("\\cancel") {
+        let statement_id = statement_id.trim();
+        if statement_id.is_empty() {
+            println!("Usage: \\cancel <statement_id>");
+            return Ok(ControlFlow::Continue);
+        }
+
+        let start = Instant::now();
+        let response = send_request(
+            stream,
+            RequestFrame {
+                request_type: RequestType::CancelStatement,
+                sql: statement_id.to_string(),
+            },
+        )
+        .await?;
+        let elapsed = start.elapsed();
+        render_response(response);
+        if *timing_enabled {
+            println!("Time: {:.3} ms", elapsed.as_secs_f64() * 1000.0);
+        }
+        return Ok(ControlFlow::Continue);
+    }
+
     println!("Unknown command: {input}. Use \\help for available commands.");
     Ok(ControlFlow::Continue)
 }
@@ -245,6 +284,10 @@ fn render_response(response: ResponseFrame) {
                 println!("rejected_connections: {}", status.rejected_connections);
                 println!("busy_requests: {}", status.busy_requests);
                 println!("resource_limit_requests: {}", status.resource_limit_requests);
+                println!("quota_rejections: {}", status.quota_rejections);
+                println!("timed_out_requests: {}", status.timed_out_requests);
+                println!("canceled_requests: {}", status.canceled_requests);
+                println!("active_statements: {}", status.active_statements);
                 println!(
                     "active_memory_intensive_requests: {}",
                     status.active_memory_intensive_requests
@@ -254,6 +297,27 @@ fn render_response(response: ResponseFrame) {
                 println!("mvcc_rolled_back: {}", status.mvcc_rolled_back);
                 println!("mvcc_write_conflicts: {}", status.mvcc_write_conflicts);
                 println!("mvcc_active_transactions: {}", status.mvcc_active_transactions);
+            }
+            ResponsePayload::ActiveStatements(payload) => {
+                if payload.statements.is_empty() {
+                    println!("No active statements");
+                } else {
+                    for statement in payload.statements {
+                        println!("statement_id: {}", statement.statement_id);
+                        println!("connection_id: {}", statement.connection_id);
+                        println!("identity: {}", statement.identity);
+                        println!("request_type: {}", statement.request_type);
+                        println!("runtime_ms: {}", statement.runtime_ms);
+                        println!("cancel_requested: {}", statement.cancel_requested);
+                        println!("sql_preview: {}", statement.sql_preview);
+                        println!();
+                    }
+                }
+            }
+            ResponsePayload::StatementCancellation(payload) => {
+                println!("statement_id: {}", payload.statement_id);
+                println!("accepted: {}", payload.accepted);
+                println!("status: {}", payload.status);
             }
         },
         ResponseFrame::Err(error) => {
@@ -350,4 +414,6 @@ fn print_help() {
     println!("  \\health               Request liveness status");
     println!("  \\ready                Request readiness status");
     println!("  \\status               Request admin runtime diagnostics");
+    println!("  \\queries              List active statements");
+    println!("  \\cancel <id>          Signal cancellation for an active statement");
 }

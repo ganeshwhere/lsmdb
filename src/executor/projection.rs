@@ -3,11 +3,12 @@ use std::cmp::Ordering;
 use crate::sql::ast::{Expr, OrderByExpr, SelectItem, SortDirection};
 
 use super::filter::evaluate_expr;
-use super::{ExecutionError, ExecutionLimits, RowSet, ScalarValue};
+use super::{ExecutionContext, ExecutionError, RowSet, ScalarValue};
 
 pub(crate) fn apply_projection(
     input: RowSet,
     projection: &[SelectItem],
+    context: &ExecutionContext<'_>,
 ) -> Result<RowSet, ExecutionError> {
     if projection.len() == 1 && matches!(projection[0], SelectItem::Wildcard) {
         return Ok(input);
@@ -23,6 +24,7 @@ pub(crate) fn apply_projection(
 
     let mut projected_rows = Vec::with_capacity(rows.len());
     for row in rows {
+        context.checkpoint()?;
         let source = row.clone();
         let mut materialized = row;
         for (index, item) in projection.iter().enumerate() {
@@ -42,18 +44,19 @@ pub(crate) fn apply_projection(
 pub(crate) fn apply_sort(
     input: RowSet,
     order_by: &[OrderByExpr],
-    limits: &ExecutionLimits,
+    context: &ExecutionContext<'_>,
 ) -> Result<RowSet, ExecutionError> {
     if order_by.is_empty() {
         return Ok(input);
     }
 
     let RowSet { columns, rows, table_name } = input;
-    limits.ensure_sort_rows(rows.len())?;
+    context.limits.ensure_sort_rows(rows.len())?;
 
     let mut keyed = rows
         .into_iter()
         .map(|row| {
+            context.checkpoint()?;
             let sort_keys = order_by
                 .iter()
                 .map(|entry| evaluate_expr(&entry.expr, &row, table_name.as_deref()))
@@ -70,7 +73,12 @@ pub(crate) fn apply_sort(
     Ok(RowSet { columns, rows, table_name })
 }
 
-pub(crate) fn apply_limit(mut input: RowSet, limit: u64) -> Result<RowSet, ExecutionError> {
+pub(crate) fn apply_limit(
+    mut input: RowSet,
+    limit: u64,
+    context: &ExecutionContext<'_>,
+) -> Result<RowSet, ExecutionError> {
+    context.checkpoint()?;
     let limit = usize::try_from(limit).unwrap_or(usize::MAX);
     input.rows.truncate(limit);
     Ok(input)
@@ -148,8 +156,17 @@ fn scalar_sort_tag(value: &ScalarValue) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::executor::ExecutionLimits;
+    use crate::executor::governance::ExecutionGovernance;
     use crate::executor::{Row, ScalarValue};
     use crate::sql::ast::BinaryOp;
+
+    fn test_context() -> ExecutionContext<'static> {
+        ExecutionContext {
+            limits: Box::leak(Box::new(ExecutionLimits::default())),
+            governance: Box::leak(Box::new(ExecutionGovernance::default())),
+        }
+    }
 
     #[test]
     fn projects_expression_columns() {
@@ -170,6 +187,7 @@ mod tests {
                 op: BinaryOp::Add,
                 right: Box::new(Expr::Identifier("b".to_string())),
             })],
+            &test_context(),
         )
         .expect("projection");
 
@@ -196,7 +214,7 @@ mod tests {
                 expr: Expr::Identifier("id".to_string()),
                 direction: SortDirection::Desc,
             }],
-            &ExecutionLimits::default(),
+            &test_context(),
         )
         .expect("sort");
 
