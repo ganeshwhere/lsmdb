@@ -1,16 +1,21 @@
 use std::net::SocketAddr;
 use std::str::from_utf8;
 use std::sync::Arc;
+use std::time::Duration;
 
 use lsmdb::catalog::Catalog;
+use lsmdb::executor::{ExecutionResult, ExecutionSession};
 use lsmdb::mvcc::MvccStore;
+use lsmdb::planner::plan_statement;
 use lsmdb::server::{
-    AdminStatusPayload, ErrorCode, ErrorPayload, HealthPayload, PROTOCOL_VERSION, QueryPayload,
-    ReadinessPayload, RequestFrame, RequestType, ResponseFrame, ResponsePayload, ServerLimits,
-    ServerOptions, TransactionState, read_response, start_server, start_server_with_options,
-    write_request,
+    ActiveStatementsPayload, AdminStatusPayload, ErrorCode, ErrorPayload, HealthPayload,
+    PROTOCOL_VERSION, QueryPayload, ReadinessPayload, RequestFrame, RequestType, ResponseFrame,
+    ResponsePayload, ServerLimits, ServerOptions, StatementCancellationPayload, TransactionState,
+    read_response, start_server, start_server_with_options, write_request,
 };
+use lsmdb::sql::{parse_statement, validate_statement};
 use tokio::net::TcpStream;
+use tokio::time::sleep;
 
 async fn send_request(stream: &mut TcpStream, request: RequestFrame) -> ResponseFrame {
     write_request(stream, &request).await.expect("write request");
@@ -57,6 +62,66 @@ fn response_to_error(response: ResponseFrame) -> ErrorPayload {
         ResponseFrame::Err(payload) => payload,
         other => panic!("expected error payload, got {other:?}"),
     }
+}
+
+fn response_to_active_statements(response: ResponseFrame) -> ActiveStatementsPayload {
+    match response {
+        ResponseFrame::Ok(ResponsePayload::ActiveStatements(payload)) => payload,
+        other => panic!("expected active statements payload, got {other:?}"),
+    }
+}
+
+fn response_to_statement_cancellation(response: ResponseFrame) -> StatementCancellationPayload {
+    match response {
+        ResponseFrame::Ok(ResponsePayload::StatementCancellation(payload)) => payload,
+        other => panic!("expected statement cancellation payload, got {other:?}"),
+    }
+}
+
+fn execute_setup_sql(catalog: &Catalog, store: &MvccStore, sql: &str) -> ExecutionResult {
+    let statement = parse_statement(sql).expect("parse setup SQL");
+    validate_statement(catalog, &statement).expect("validate setup SQL");
+    let plan = plan_statement(catalog, &statement).expect("plan setup SQL");
+    let mut session = ExecutionSession::new(catalog, store);
+    session.execute_plan(&plan).expect("execute setup SQL")
+}
+
+fn populate_users(catalog: &Catalog, store: &MvccStore, rows: usize) {
+    execute_setup_sql(
+        catalog,
+        store,
+        "CREATE TABLE users (id BIGINT NOT NULL, email TEXT NOT NULL, PRIMARY KEY (id))",
+    );
+    for id in 1..=rows {
+        execute_setup_sql(
+            catalog,
+            store,
+            &format!(
+                "INSERT INTO users (id, email) VALUES ({id}, '{}')",
+                format!("user{id:05}@example.com")
+            ),
+        );
+    }
+}
+
+async fn wait_for_active_statement_id(stream: &mut TcpStream, request_type: &str) -> u64 {
+    for _ in 0..500 {
+        let payload = response_to_active_statements(
+            send_request(
+                stream,
+                RequestFrame { request_type: RequestType::ActiveStatements, sql: String::new() },
+            )
+            .await,
+        );
+        if let Some(statement) =
+            payload.statements.into_iter().find(|statement| statement.request_type == request_type)
+        {
+            return statement.statement_id;
+        }
+        sleep(Duration::from_millis(1)).await;
+    }
+
+    panic!("timed out waiting for active statement");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -286,6 +351,10 @@ async fn server_exposes_health_readiness_and_admin_status() {
     assert_eq!(admin.rejected_connections, 0);
     assert_eq!(admin.busy_requests, 0);
     assert_eq!(admin.resource_limit_requests, 0);
+    assert_eq!(admin.quota_rejections, 0);
+    assert_eq!(admin.timed_out_requests, 0);
+    assert_eq!(admin.canceled_requests, 0);
+    assert_eq!(admin.active_statements, 0);
     assert_eq!(admin.active_memory_intensive_requests, 0);
     assert_eq!(admin.mvcc_started, 0);
     assert_eq!(admin.mvcc_committed, 0);
@@ -476,6 +545,222 @@ async fn server_enforces_statement_count_limit() {
     );
     assert_eq!(error.code, ErrorCode::ResourceLimit);
     assert!(error.message.contains("statements"));
+
+    server.shutdown().await.expect("shutdown server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_times_out_long_running_scan_and_sort_queries() {
+    let store = Arc::new(MvccStore::new());
+    let catalog = Arc::new(Catalog::open((*store).clone()).expect("open catalog"));
+    populate_users(&catalog, &store, 25_000);
+
+    let options = ServerOptions {
+        limits: ServerLimits { statement_timeout_ms: Some(1), ..ServerLimits::default() },
+    };
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("parse socket addr");
+    let server =
+        start_server_with_options(bind_addr, Arc::clone(&catalog), Arc::clone(&store), options)
+            .await
+            .expect("start server");
+    let server_addr = server.local_addr();
+
+    let mut client = TcpStream::connect(server_addr).await.expect("connect client");
+
+    let scan_error = response_to_error(
+        send_request(
+            &mut client,
+            RequestFrame {
+                request_type: RequestType::Query,
+                sql: "SELECT id, email FROM users".to_string(),
+            },
+        )
+        .await,
+    );
+    assert_eq!(scan_error.code, ErrorCode::Timeout);
+    assert!(scan_error.message.contains("timed out"));
+
+    let sort_error = response_to_error(
+        send_request(
+            &mut client,
+            RequestFrame {
+                request_type: RequestType::Query,
+                sql: "SELECT id FROM users ORDER BY email DESC".to_string(),
+            },
+        )
+        .await,
+    );
+    assert_eq!(sort_error.code, ErrorCode::Timeout);
+    assert!(sort_error.message.contains("timed out"));
+
+    let admin = response_to_admin_status(
+        send_request(
+            &mut client,
+            RequestFrame { request_type: RequestType::AdminStatus, sql: String::new() },
+        )
+        .await,
+    );
+    assert!(admin.timed_out_requests >= 2);
+
+    server.shutdown().await.expect("shutdown server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_rejects_queries_when_identity_quota_is_reached() {
+    let store = Arc::new(MvccStore::new());
+    let catalog = Arc::new(Catalog::open((*store).clone()).expect("open catalog"));
+    populate_users(&catalog, &store, 60_000);
+
+    let options = ServerOptions {
+        limits: ServerLimits {
+            max_concurrent_queries_per_identity: Some(1),
+            statement_timeout_ms: Some(5_000),
+            ..ServerLimits::default()
+        },
+    };
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("parse socket addr");
+    let server =
+        start_server_with_options(bind_addr, Arc::clone(&catalog), Arc::clone(&store), options)
+            .await
+            .expect("start server");
+    let server_addr = server.local_addr();
+
+    let mut query_client = TcpStream::connect(server_addr).await.expect("connect query client");
+    let query_task = tokio::spawn(async move {
+        send_request(
+            &mut query_client,
+            RequestFrame {
+                request_type: RequestType::Query,
+                sql: "UPDATE users SET email = 'quota@example.com'".to_string(),
+            },
+        )
+        .await
+    });
+
+    let mut admin_client = TcpStream::connect(server_addr).await.expect("connect admin client");
+    let statement_id = wait_for_active_statement_id(&mut admin_client, "QUERY").await;
+
+    let mut second_client = TcpStream::connect(server_addr).await.expect("connect second client");
+    let quota_error = response_to_error(
+        send_request(
+            &mut second_client,
+            RequestFrame {
+                request_type: RequestType::Query,
+                sql: "SELECT id FROM users ORDER BY email ASC".to_string(),
+            },
+        )
+        .await,
+    );
+    assert_eq!(quota_error.code, ErrorCode::Quota);
+    assert!(quota_error.retryable);
+
+    let cancel = response_to_statement_cancellation(
+        send_request(
+            &mut admin_client,
+            RequestFrame {
+                request_type: RequestType::CancelStatement,
+                sql: statement_id.to_string(),
+            },
+        )
+        .await,
+    );
+    assert_eq!(cancel.statement_id, statement_id);
+    assert!(cancel.accepted);
+
+    let canceled = response_to_error(query_task.await.expect("query task"));
+    assert_eq!(canceled.code, ErrorCode::Canceled);
+
+    let admin = response_to_admin_status(
+        send_request(
+            &mut admin_client,
+            RequestFrame { request_type: RequestType::AdminStatus, sql: String::new() },
+        )
+        .await,
+    );
+    assert!(admin.quota_rejections >= 1);
+    assert!(admin.canceled_requests >= 1);
+
+    server.shutdown().await.expect("shutdown server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_cancellation_rolls_back_active_transaction_state() {
+    let store = Arc::new(MvccStore::new());
+    let catalog = Arc::new(Catalog::open((*store).clone()).expect("open catalog"));
+    populate_users(&catalog, &store, 50_000);
+
+    let options = ServerOptions {
+        limits: ServerLimits { statement_timeout_ms: Some(5_000), ..ServerLimits::default() },
+    };
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("parse socket addr");
+    let server =
+        start_server_with_options(bind_addr, Arc::clone(&catalog), Arc::clone(&store), options)
+            .await
+            .expect("start server");
+    let server_addr = server.local_addr();
+
+    let mut txn_client = TcpStream::connect(server_addr).await.expect("connect txn client");
+    let begin = send_request(
+        &mut txn_client,
+        RequestFrame { request_type: RequestType::Begin, sql: String::new() },
+    )
+    .await;
+    assert!(matches!(
+        begin,
+        ResponseFrame::Ok(ResponsePayload::TransactionState(TransactionState::Begun))
+    ));
+
+    let txn_task = tokio::spawn(async move {
+        let update = send_request(
+            &mut txn_client,
+            RequestFrame {
+                request_type: RequestType::Query,
+                sql: "UPDATE users SET email = 'blocked@example.com'".to_string(),
+            },
+        )
+        .await;
+        let commit = send_request(
+            &mut txn_client,
+            RequestFrame { request_type: RequestType::Commit, sql: String::new() },
+        )
+        .await;
+        (update, commit)
+    });
+
+    let mut admin_client = TcpStream::connect(server_addr).await.expect("connect admin client");
+    let statement_id = wait_for_active_statement_id(&mut admin_client, "QUERY").await;
+    let cancel = response_to_statement_cancellation(
+        send_request(
+            &mut admin_client,
+            RequestFrame {
+                request_type: RequestType::CancelStatement,
+                sql: statement_id.to_string(),
+            },
+        )
+        .await,
+    );
+    assert!(cancel.accepted);
+
+    let (update, commit) = txn_task.await.expect("txn task");
+    let update_error = response_to_error(update);
+    assert_eq!(update_error.code, ErrorCode::Canceled);
+
+    let commit_error = response_to_error(commit);
+    assert_eq!(commit_error.code, ErrorCode::Execution);
+    assert!(commit_error.message.contains("no active transaction"));
+
+    let mut verify_client = TcpStream::connect(server_addr).await.expect("connect verify client");
+    let result = response_to_query(
+        send_request(
+            &mut verify_client,
+            RequestFrame {
+                request_type: RequestType::Query,
+                sql: "SELECT email FROM users WHERE id = 1".to_string(),
+            },
+        )
+        .await,
+    );
+    assert_eq!(from_utf8(&result.rows[0][0]).expect("utf8 cell"), "user00001@example.com");
 
     server.shutdown().await.expect("shutdown server");
 }

@@ -5,21 +5,26 @@ use crate::planner::UpdateNode;
 use super::filter::{evaluate_expr, evaluate_predicate};
 use super::scan::scan_table_rows;
 use super::{
-    ExecutionError, build_row_key, coerce_row_for_table, coerce_scalar_for_column, encode_row,
+    ExecutionContext, ExecutionError, apply_staged_writes, build_row_key, coerce_row_for_table,
+    coerce_scalar_for_column, encode_row, staged_value_for_key,
 };
 
 pub(crate) fn execute_update(
     catalog: &Catalog,
     tx: &mut Transaction,
     node: &UpdateNode,
+    context: &ExecutionContext<'_>,
 ) -> Result<u64, ExecutionError> {
+    context.checkpoint()?;
     let table = catalog
         .get_table(&node.table)
         .ok_or_else(|| ExecutionError::TableNotFound(node.table.clone()))?;
-    let (_, rows) = scan_table_rows(catalog, tx, &table.name, usize::MAX)?;
+    let (_, rows) = scan_table_rows(catalog, tx, &table.name, usize::MAX, context)?;
 
     let mut affected = 0_u64;
+    let mut staged = std::collections::BTreeMap::new();
     for stored in rows {
+        context.checkpoint()?;
         if let Some(predicate) = &node.predicate {
             if !evaluate_predicate(predicate, &stored.values, Some(&table.name))? {
                 continue;
@@ -43,16 +48,17 @@ pub(crate) fn execute_update(
         let normalized = coerce_row_for_table(&table, &updated)?;
         let new_key = build_row_key(&table, &normalized)?;
         if new_key != stored.key {
-            if tx.get(&new_key)?.is_some() {
+            if staged_value_for_key(tx, &staged, &new_key)?.is_some() {
                 return Err(ExecutionError::PrimaryKeyConflict { table: table.name.clone() });
             }
-            tx.delete(&stored.key)?;
+            staged.insert(stored.key.clone(), None);
         }
 
         let payload = encode_row(&table, &normalized)?;
-        tx.put(&new_key, &payload)?;
+        staged.insert(new_key, Some(payload));
         affected = affected.saturating_add(1);
     }
 
+    apply_staged_writes(tx, staged)?;
     Ok(affected)
 }

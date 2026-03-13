@@ -18,6 +18,8 @@ pub enum RequestType {
     Health = 6,
     Readiness = 7,
     AdminStatus = 8,
+    ActiveStatements = 9,
+    CancelStatement = 10,
 }
 
 impl TryFrom<u8> for RequestType {
@@ -33,6 +35,8 @@ impl TryFrom<u8> for RequestType {
             6 => Ok(RequestType::Health),
             7 => Ok(RequestType::Readiness),
             8 => Ok(RequestType::AdminStatus),
+            9 => Ok(RequestType::ActiveStatements),
+            10 => Ok(RequestType::CancelStatement),
             other => {
                 Err(ProtocolError::InvalidFrame(format!("unknown request type byte: {other}")))
             }
@@ -62,6 +66,9 @@ pub enum ErrorCode {
     Execution = 5,
     Busy = 6,
     ResourceLimit = 7,
+    Timeout = 8,
+    Canceled = 9,
+    Quota = 10,
 }
 
 impl TryFrom<u8> for ErrorCode {
@@ -76,6 +83,9 @@ impl TryFrom<u8> for ErrorCode {
             5 => Ok(ErrorCode::Execution),
             6 => Ok(ErrorCode::Busy),
             7 => Ok(ErrorCode::ResourceLimit),
+            8 => Ok(ErrorCode::Timeout),
+            9 => Ok(ErrorCode::Canceled),
+            10 => Ok(ErrorCode::Quota),
             other => Err(ProtocolError::InvalidFrame(format!("unknown error code byte: {other}"))),
         }
     }
@@ -91,6 +101,9 @@ impl ErrorCode {
             ErrorCode::Execution => "EXECUTION",
             ErrorCode::Busy => "BUSY",
             ErrorCode::ResourceLimit => "RESOURCE_LIMIT",
+            ErrorCode::Timeout => "TIMEOUT",
+            ErrorCode::Canceled => "CANCELED",
+            ErrorCode::Quota => "QUOTA",
         }
     }
 }
@@ -117,6 +130,8 @@ pub enum ResponsePayload {
     Health(HealthPayload),
     Readiness(ReadinessPayload),
     AdminStatus(AdminStatusPayload),
+    ActiveStatements(ActiveStatementsPayload),
+    StatementCancellation(StatementCancellationPayload),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -148,12 +163,39 @@ pub struct AdminStatusPayload {
     pub rejected_connections: u64,
     pub busy_requests: u64,
     pub resource_limit_requests: u64,
+    pub quota_rejections: u64,
+    pub timed_out_requests: u64,
+    pub canceled_requests: u64,
+    pub active_statements: u64,
     pub active_memory_intensive_requests: u64,
     pub mvcc_started: u64,
     pub mvcc_committed: u64,
     pub mvcc_rolled_back: u64,
     pub mvcc_write_conflicts: u64,
     pub mvcc_active_transactions: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveStatementsPayload {
+    pub statements: Vec<ActiveStatementPayload>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveStatementPayload {
+    pub statement_id: u64,
+    pub connection_id: u64,
+    pub identity: String,
+    pub request_type: String,
+    pub runtime_ms: u64,
+    pub cancel_requested: bool,
+    pub sql_preview: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatementCancellationPayload {
+    pub statement_id: u64,
+    pub accepted: bool,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -443,12 +485,35 @@ fn encode_payload(payload: &ResponsePayload, out: &mut Vec<u8>) -> Result<(), Pr
             out.extend(status.rejected_connections.to_be_bytes());
             out.extend(status.busy_requests.to_be_bytes());
             out.extend(status.resource_limit_requests.to_be_bytes());
+            out.extend(status.quota_rejections.to_be_bytes());
+            out.extend(status.timed_out_requests.to_be_bytes());
+            out.extend(status.canceled_requests.to_be_bytes());
+            out.extend(status.active_statements.to_be_bytes());
             out.extend(status.active_memory_intensive_requests.to_be_bytes());
             out.extend(status.mvcc_started.to_be_bytes());
             out.extend(status.mvcc_committed.to_be_bytes());
             out.extend(status.mvcc_rolled_back.to_be_bytes());
             out.extend(status.mvcc_write_conflicts.to_be_bytes());
             out.extend(status.mvcc_active_transactions.to_be_bytes());
+        }
+        ResponsePayload::ActiveStatements(payload) => {
+            out.push(8_u8);
+            write_u32(out, payload.statements.len())?;
+            for statement in &payload.statements {
+                out.extend(statement.statement_id.to_be_bytes());
+                out.extend(statement.connection_id.to_be_bytes());
+                write_len_prefixed_bytes(out, statement.identity.as_bytes())?;
+                write_len_prefixed_bytes(out, statement.request_type.as_bytes())?;
+                out.extend(statement.runtime_ms.to_be_bytes());
+                out.push(u8::from(statement.cancel_requested));
+                write_len_prefixed_bytes(out, statement.sql_preview.as_bytes())?;
+            }
+        }
+        ResponsePayload::StatementCancellation(payload) => {
+            out.push(9_u8);
+            out.extend(payload.statement_id.to_be_bytes());
+            out.push(u8::from(payload.accepted));
+            write_len_prefixed_bytes(out, payload.status.as_bytes())?;
         }
     }
     Ok(())
@@ -518,6 +583,10 @@ fn decode_payload(cursor: &mut Cursor<&[u8]>) -> Result<ResponsePayload, Protoco
             let rejected_connections = read_u64(cursor)?;
             let busy_requests = read_u64(cursor)?;
             let resource_limit_requests = read_u64(cursor)?;
+            let quota_rejections = read_u64(cursor)?;
+            let timed_out_requests = read_u64(cursor)?;
+            let canceled_requests = read_u64(cursor)?;
+            let active_statements = read_u64(cursor)?;
             let active_memory_intensive_requests = read_u64(cursor)?;
             let mvcc_started = read_u64(cursor)?;
             let mvcc_committed = read_u64(cursor)?;
@@ -534,12 +603,49 @@ fn decode_payload(cursor: &mut Cursor<&[u8]>) -> Result<ResponsePayload, Protoco
                 rejected_connections,
                 busy_requests,
                 resource_limit_requests,
+                quota_rejections,
+                timed_out_requests,
+                canceled_requests,
+                active_statements,
                 active_memory_intensive_requests,
                 mvcc_started,
                 mvcc_committed,
                 mvcc_rolled_back,
                 mvcc_write_conflicts,
                 mvcc_active_transactions,
+            }))
+        }
+        8 => {
+            let count = read_u32(cursor)? as usize;
+            let mut statements = Vec::with_capacity(count);
+            for _ in 0..count {
+                let statement_id = read_u64(cursor)?;
+                let connection_id = read_u64(cursor)?;
+                let identity = read_len_prefixed_string(cursor)?;
+                let request_type = read_len_prefixed_string(cursor)?;
+                let runtime_ms = read_u64(cursor)?;
+                let cancel_requested = read_bool(cursor)?;
+                let sql_preview = read_len_prefixed_string(cursor)?;
+                statements.push(ActiveStatementPayload {
+                    statement_id,
+                    connection_id,
+                    identity,
+                    request_type,
+                    runtime_ms,
+                    cancel_requested,
+                    sql_preview,
+                });
+            }
+            Ok(ResponsePayload::ActiveStatements(ActiveStatementsPayload { statements }))
+        }
+        9 => {
+            let statement_id = read_u64(cursor)?;
+            let accepted = read_bool(cursor)?;
+            let status = read_len_prefixed_string(cursor)?;
+            Ok(ResponsePayload::StatementCancellation(StatementCancellationPayload {
+                statement_id,
+                accepted,
+                status,
             }))
         }
         other => {
@@ -687,6 +793,10 @@ mod tests {
             rejected_connections: 2,
             busy_requests: 3,
             resource_limit_requests: 1,
+            quota_rejections: 4,
+            timed_out_requests: 5,
+            canceled_requests: 6,
+            active_statements: 7,
             active_memory_intensive_requests: 0,
             mvcc_started: 12,
             mvcc_committed: 9,
@@ -694,6 +804,26 @@ mod tests {
             mvcc_write_conflicts: 1,
             mvcc_active_transactions: 0,
         }));
+        let (mut client, mut server) = tokio::io::duplex(2048);
+        write_response(&mut client, &response).await.expect("write response");
+        let decoded = read_response(&mut server).await.expect("read response").expect("response");
+        assert_eq!(decoded, response);
+    }
+
+    #[tokio::test]
+    async fn active_statements_payload_round_trip() {
+        let response =
+            ResponseFrame::Ok(ResponsePayload::ActiveStatements(ActiveStatementsPayload {
+                statements: vec![ActiveStatementPayload {
+                    statement_id: 11,
+                    connection_id: 3,
+                    identity: "127.0.0.1".to_string(),
+                    request_type: "QUERY".to_string(),
+                    runtime_ms: 27,
+                    cancel_requested: false,
+                    sql_preview: "SELECT * FROM users".to_string(),
+                }],
+            }));
         let (mut client, mut server) = tokio::io::duplex(2048);
         write_response(&mut client, &response).await.expect("write response");
         let decoded = read_response(&mut server).await.expect("read response").expect("response");

@@ -1,18 +1,24 @@
 use crate::sql::ast::{BinaryOp, Expr, UnaryOp};
 
-use super::{ExecutionError, Row, RowSet, ScalarValue, literal_to_scalar, scalar_type_name};
+use super::{
+    ExecutionContext, ExecutionError, Row, RowSet, ScalarValue, literal_to_scalar, scalar_type_name,
+};
 
-pub(crate) fn apply_filter(input: RowSet, predicate: &Expr) -> Result<RowSet, ExecutionError> {
+pub(crate) fn apply_filter(
+    input: RowSet,
+    predicate: &Expr,
+    context: &ExecutionContext<'_>,
+) -> Result<RowSet, ExecutionError> {
     let RowSet { columns, rows, table_name } = input;
 
-    let filtered_rows = rows
-        .into_iter()
-        .filter_map(|row| match evaluate_predicate(predicate, &row, table_name.as_deref()) {
-            Ok(true) => Some(Ok(row)),
-            Ok(false) => None,
-            Err(err) => Some(Err(err)),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut filtered_rows = Vec::new();
+    for row in rows {
+        context.checkpoint()?;
+        match evaluate_predicate(predicate, &row, table_name.as_deref())? {
+            true => filtered_rows.push(row),
+            false => {}
+        }
+    }
 
     Ok(RowSet { columns, rows: filtered_rows, table_name })
 }
@@ -312,7 +318,16 @@ fn as_numeric(value: &ScalarValue) -> Result<Numeric, ExecutionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::executor::ExecutionLimits;
+    use crate::executor::governance::ExecutionGovernance;
     use crate::sql::ast::LiteralValue;
+
+    fn test_context() -> ExecutionContext<'static> {
+        ExecutionContext {
+            limits: Box::leak(Box::new(ExecutionLimits::default())),
+            governance: Box::leak(Box::new(ExecutionGovernance::default())),
+        }
+    }
 
     #[test]
     fn evaluates_arithmetic_expression() {
@@ -353,7 +368,7 @@ mod tests {
             right: Box::new(Expr::Literal(LiteralValue::Integer(2))),
         };
 
-        let filtered = apply_filter(row_set, &predicate).expect("filter");
+        let filtered = apply_filter(row_set, &predicate, &test_context()).expect("filter");
         assert_eq!(filtered.rows.len(), 1);
     }
 }

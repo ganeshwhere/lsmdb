@@ -222,28 +222,7 @@ impl MvccStore {
     }
 
     pub fn scan_prefix_at(&self, prefix: &[u8], read_ts: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let data = self.inner.data.read();
-        let mut rows = Vec::new();
-
-        for (key, versions) in &data.versions {
-            if !key.starts_with(prefix) {
-                continue;
-            }
-
-            for version in versions.iter().rev() {
-                if version.commit_ts > read_ts {
-                    continue;
-                }
-
-                if let Some(value) = &version.value {
-                    rows.push((key.clone(), value.clone()));
-                }
-                break;
-            }
-        }
-
-        rows.sort_by(|a, b| a.0.cmp(&b.0));
-        rows
+        self.scan_prefix_at_with_observer(prefix, read_ts, |_| true)
     }
 
     pub fn scan_prefix_at_limited(
@@ -252,6 +231,31 @@ impl MvccStore {
         read_ts: u64,
         max_rows: usize,
     ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.scan_prefix_at_limited_with_observer(prefix, read_ts, max_rows, |_| true)
+    }
+
+    pub fn scan_prefix_at_with_observer<F>(
+        &self,
+        prefix: &[u8],
+        read_ts: u64,
+        observer: F,
+    ) -> Vec<(Vec<u8>, Vec<u8>)>
+    where
+        F: FnMut(usize) -> bool,
+    {
+        self.scan_prefix_at_limited_with_observer(prefix, read_ts, usize::MAX, observer)
+    }
+
+    pub fn scan_prefix_at_limited_with_observer<F>(
+        &self,
+        prefix: &[u8],
+        read_ts: u64,
+        max_rows: usize,
+        mut observer: F,
+    ) -> Vec<(Vec<u8>, Vec<u8>)>
+    where
+        F: FnMut(usize) -> bool,
+    {
         let data = self.inner.data.read();
         let mut rows = Vec::new();
 
@@ -267,6 +271,10 @@ impl MvccStore {
 
                 if let Some(value) = &version.value {
                     rows.push((key.clone(), value.clone()));
+                    if !observer(rows.len()) {
+                        rows.sort_by(|a, b| a.0.cmp(&b.0));
+                        return rows;
+                    }
                     if rows.len() >= max_rows {
                         rows.sort_by(|a, b| a.0.cmp(&b.0));
                         return rows;
@@ -490,11 +498,34 @@ impl Transaction {
         Ok(visible.into_iter().collect())
     }
 
+    pub fn scan_prefix_with_observer<F>(
+        &self,
+        prefix: &[u8],
+        observer: F,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TransactionError>
+    where
+        F: FnMut(usize) -> bool,
+    {
+        self.scan_prefix_limited_with_observer(prefix, usize::MAX, observer)
+    }
+
     pub fn scan_prefix_limited(
         &self,
         prefix: &[u8],
         max_rows: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TransactionError> {
+        self.scan_prefix_limited_with_observer(prefix, max_rows, |_| true)
+    }
+
+    pub fn scan_prefix_limited_with_observer<F>(
+        &self,
+        prefix: &[u8],
+        max_rows: usize,
+        mut observer: F,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TransactionError>
+    where
+        F: FnMut(usize) -> bool,
+    {
         if self.closed {
             return Err(TransactionError::Closed);
         }
@@ -504,10 +535,13 @@ impl Transaction {
         let fetch_limit = max_rows.saturating_add(write_overlap).saturating_add(1);
         let mut visible = self
             .store
-            .scan_prefix_at_limited(prefix, read_ts, fetch_limit)
+            .scan_prefix_at_limited_with_observer(prefix, read_ts, fetch_limit, |seen| {
+                observer(seen)
+            })
             .into_iter()
             .collect::<BTreeMap<_, _>>();
 
+        let mut observed = visible.len();
         for (key, value) in &self.writes {
             if !key.starts_with(prefix) {
                 continue;
@@ -520,6 +554,10 @@ impl Transaction {
                 None => {
                     visible.remove(key);
                 }
+            }
+            observed = observed.saturating_add(1);
+            if !observer(observed) {
+                break;
             }
         }
 

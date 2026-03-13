@@ -79,11 +79,14 @@ pub struct ServerConfig {
     pub max_in_flight_requests_per_connection: usize,
     pub max_request_bytes: usize,
     pub max_statements_per_request: usize,
+    pub statement_timeout_ms: Option<u64>,
     pub max_memory_intensive_requests: usize,
     pub max_scan_rows: usize,
     pub max_sort_rows: usize,
     pub max_join_rows: usize,
     pub max_query_result_rows: usize,
+    pub max_query_result_bytes: usize,
+    pub max_concurrent_queries_per_identity: Option<usize>,
 }
 
 impl Default for ServerConfig {
@@ -94,11 +97,14 @@ impl Default for ServerConfig {
             max_in_flight_requests_per_connection: defaults.max_in_flight_requests_per_connection,
             max_request_bytes: defaults.max_request_bytes,
             max_statements_per_request: defaults.max_statements_per_request,
+            statement_timeout_ms: defaults.statement_timeout_ms,
             max_memory_intensive_requests: defaults.max_memory_intensive_requests,
             max_scan_rows: defaults.max_scan_rows,
             max_sort_rows: defaults.max_sort_rows,
             max_join_rows: defaults.max_join_rows,
             max_query_result_rows: defaults.max_query_result_rows,
+            max_query_result_bytes: defaults.max_query_result_bytes,
+            max_concurrent_queries_per_identity: defaults.max_concurrent_queries_per_identity,
         }
     }
 }
@@ -278,11 +284,14 @@ pub struct StartupDiagnostics {
     pub server_max_in_flight_requests_per_connection: usize,
     pub server_max_request_bytes: usize,
     pub server_max_statements_per_request: usize,
+    pub server_statement_timeout_ms: Option<u64>,
     pub server_max_memory_intensive_requests: usize,
     pub server_max_scan_rows: usize,
     pub server_max_sort_rows: usize,
     pub server_max_join_rows: usize,
     pub server_max_query_result_rows: usize,
+    pub server_max_query_result_bytes: usize,
+    pub server_max_concurrent_queries_per_identity: Option<usize>,
     pub wal_segment_size_bytes: u64,
     pub wal_sync_mode: SyncModeConfig,
     pub sstable_data_block_size_bytes: usize,
@@ -310,6 +319,10 @@ impl StartupDiagnostics {
             format!("server.max_request_bytes={}", self.server_max_request_bytes),
             format!("server.max_statements_per_request={}", self.server_max_statements_per_request),
             format!(
+                "server.statement_timeout_ms={}",
+                format_optional_u64(self.server_statement_timeout_ms)
+            ),
+            format!(
                 "server.max_memory_intensive_requests={}",
                 self.server_max_memory_intensive_requests
             ),
@@ -317,6 +330,11 @@ impl StartupDiagnostics {
             format!("server.max_sort_rows={}", self.server_max_sort_rows),
             format!("server.max_join_rows={}", self.server_max_join_rows),
             format!("server.max_query_result_rows={}", self.server_max_query_result_rows),
+            format!("server.max_query_result_bytes={}", self.server_max_query_result_bytes),
+            format!(
+                "server.max_concurrent_queries_per_identity={}",
+                format_optional_usize(self.server_max_concurrent_queries_per_identity)
+            ),
             format!("wal.segment_size_bytes={}", self.wal_segment_size_bytes),
             format!("wal.sync_mode={}", self.wal_sync_mode.as_str()),
             format!("sstable.data_block_size_bytes={}", self.sstable_data_block_size_bytes),
@@ -411,6 +429,9 @@ impl LsmdbConfig {
         if self.server.max_statements_per_request == 0 {
             return Err(invalid("server.max_statements_per_request", "must be > 0"));
         }
+        if matches!(self.server.statement_timeout_ms, Some(0)) {
+            return Err(invalid("server.statement_timeout_ms", "must be > 0 when set"));
+        }
         if self.server.max_memory_intensive_requests == 0 {
             return Err(invalid("server.max_memory_intensive_requests", "must be > 0"));
         }
@@ -425,6 +446,15 @@ impl LsmdbConfig {
         }
         if self.server.max_query_result_rows == 0 {
             return Err(invalid("server.max_query_result_rows", "must be > 0"));
+        }
+        if self.server.max_query_result_bytes == 0 {
+            return Err(invalid("server.max_query_result_bytes", "must be > 0"));
+        }
+        if matches!(self.server.max_concurrent_queries_per_identity, Some(0)) {
+            return Err(invalid(
+                "server.max_concurrent_queries_per_identity",
+                "must be > 0 when set",
+            ));
         }
         if self.wal.segment_size_bytes < MIN_WAL_SEGMENT_SIZE_BYTES {
             return Err(invalid(
@@ -491,6 +521,7 @@ impl LsmdbConfig {
                 .max_in_flight_requests_per_connection,
             server_max_request_bytes: runtime.server_limits.max_request_bytes,
             server_max_statements_per_request: runtime.server_limits.max_statements_per_request,
+            server_statement_timeout_ms: runtime.server_limits.statement_timeout_ms,
             server_max_memory_intensive_requests: runtime
                 .server_limits
                 .max_memory_intensive_requests,
@@ -498,6 +529,10 @@ impl LsmdbConfig {
             server_max_sort_rows: runtime.server_limits.max_sort_rows,
             server_max_join_rows: runtime.server_limits.max_join_rows,
             server_max_query_result_rows: runtime.server_limits.max_query_result_rows,
+            server_max_query_result_bytes: runtime.server_limits.max_query_result_bytes,
+            server_max_concurrent_queries_per_identity: runtime
+                .server_limits
+                .max_concurrent_queries_per_identity,
             wal_segment_size_bytes: storage.wal_options.segment_size_bytes,
             wal_sync_mode: SyncModeConfig::from(storage.wal_options.sync_mode),
             sstable_data_block_size_bytes: storage.sstable_builder_options.data_block_size_bytes,
@@ -579,17 +614,28 @@ impl LsmdbConfig {
                 .max_in_flight_requests_per_connection,
             max_request_bytes: self.server.max_request_bytes,
             max_statements_per_request: self.server.max_statements_per_request,
+            statement_timeout_ms: self.server.statement_timeout_ms,
             max_memory_intensive_requests: self.server.max_memory_intensive_requests,
             max_scan_rows: self.server.max_scan_rows,
             max_sort_rows: self.server.max_sort_rows,
             max_join_rows: self.server.max_join_rows,
             max_query_result_rows: self.server.max_query_result_rows,
+            max_query_result_bytes: self.server.max_query_result_bytes,
+            max_concurrent_queries_per_identity: self.server.max_concurrent_queries_per_identity,
         }
     }
 }
 
 fn invalid(field: &'static str, message: impl Into<String>) -> ConfigError {
     ConfigError::InvalidValue { field, message: message.into() }
+}
+
+fn format_optional_u64(value: Option<u64>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_else(|| "none".to_string())
+}
+
+fn format_optional_usize(value: Option<usize>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_else(|| "none".to_string())
 }
 
 fn bloom_params_for_fpr(fpr: f64) -> (usize, u8) {
