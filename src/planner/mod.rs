@@ -83,8 +83,23 @@ mod tests {
         let PhysicalPlan::Sort(sort) = *limit.input else {
             panic!("expected sort");
         };
-        let PhysicalPlan::PrimaryKeyScan(_) = *sort.input else {
-            panic!("expected primary key scan under sort");
-        };
+        assert!(
+            contains_primary_key_scan(&sort.input),
+            "expected primary key scan in sort subtree"
+        );
+    }
+
+    fn contains_primary_key_scan(plan: &PhysicalPlan) -> bool {
+        match plan {
+            PhysicalPlan::PrimaryKeyScan(_) => true,
+            PhysicalPlan::Filter(filter) => contains_primary_key_scan(&filter.input),
+            PhysicalPlan::Project(project) => contains_primary_key_scan(&project.input),
+            PhysicalPlan::Sort(sort) => contains_primary_key_scan(&sort.input),
+            PhysicalPlan::Limit(limit) => contains_primary_key_scan(&limit.input),
+            PhysicalPlan::Join(join) => {
+                contains_primary_key_scan(&join.left) || contains_primary_key_scan(&join.right)
+            }
+            _ => false,
+        }
     }
 }

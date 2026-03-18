@@ -1,0 +1,35 @@
+name: Release Gate
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  issues: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Cargo check
+        run: cargo check --locked
+      - name: Library tests
+        run: cargo test --lib --locked
+      - name: Integration tests
+        run: ./tools/ci/run_integration_tests.sh
+      - name: Critical blocker gate
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: ./tools/release/check_critical_blockers.sh

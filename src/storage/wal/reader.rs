@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use super::record::{checksum, parse_segment_id, RecordType, BLOCK_SIZE_BYTES, HEADER_LEN};
+use super::record::{BLOCK_SIZE_BYTES, HEADER_LEN, RecordType, checksum, parse_segment_id};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct WalReplay {

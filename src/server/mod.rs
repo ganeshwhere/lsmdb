@@ -2,7 +2,15 @@ pub mod protocol;
 pub mod tcp;
 
 pub use protocol::{
-    ProtocolError, QueryPayload, RequestFrame, RequestType, ResponseFrame, ResponsePayload,
-    TransactionState, read_request, read_response, write_request, write_response,
+    ActiveStatementPayload, ActiveStatementsPayload, AdminStatusPayload, AuthenticationPayload,
+    AuthenticationRequest, ErrorCode, ErrorPayload, HealthPayload, PROTOCOL_VERSION, ProtocolError,
+    QueryPayload, ReadinessPayload, RequestFrame, RequestType, ResponseFrame, ResponsePayload,
+    StatementCancellationPayload, TransactionState, authentication_request_with_password,
+    authentication_request_with_token, decode_authentication_request, read_request,
+    read_request_with_limit, read_response, write_request, write_response,
 };
-pub use tcp::{ServerError, ServerHandle, start_server};
+pub use tcp::{
+    ServerAuthOptions, ServerError, ServerHandle, ServerLimits, ServerOptions, ServerRole,
+    ServerSecurityOptions, ServerTlsMode, ServerTlsOptions, StaticPasswordUser,
+    StaticTokenPrincipal, start_server, start_server_with_options,
+};

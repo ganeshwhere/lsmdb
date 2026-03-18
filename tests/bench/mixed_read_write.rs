@@ -325,11 +325,7 @@ fn summarize_window_throughput(values: &[f64]) -> (f64, f64, f64, f64) {
 }
 
 fn percentile_us(histogram: &Histogram<u64>, quantile: f64) -> f64 {
-    if histogram.len() == 0 {
-        0.0
-    } else {
-        histogram.value_at_quantile(quantile) as f64 / 1_000.0
-    }
+    if histogram.len() == 0 { 0.0 } else { histogram.value_at_quantile(quantile) as f64 / 1_000.0 }
 }
 
 fn build_keys(key_space: usize) -> Vec<Vec<u8>> {

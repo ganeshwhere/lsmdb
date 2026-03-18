@@ -68,15 +68,15 @@ pub fn pick_compaction(
     let mut best: Option<LeveledCompactionPlan> = None;
 
     let level0 = version_set.level_tables(0);
-    if level0.len() >= config.level0_file_limit {
+    if !level0.is_empty() {
         let target_level = 1;
         let target_tables = version_set.level_tables(target_level);
         let source = pick_smallest_overlap_source(level0, target_tables)?;
         let overlaps = overlapping_tables(source, target_tables);
 
-        let score = (level0.len() as f64 / config.level0_file_limit as f64)
-            + ((overlaps.len() as f64) * 0.01)
-            + 10.0;
+        let l0_pressure = level0.len() as f64 / config.level0_file_limit.max(1) as f64;
+        let overflow_bonus = if level0.len() >= config.level0_file_limit { 10.0 } else { 1.0 };
+        let score = l0_pressure + ((overlaps.len() as f64) * 0.01) + overflow_bonus;
 
         best = Some(LeveledCompactionPlan {
             trigger: LeveledTrigger::Level0Overflow,
