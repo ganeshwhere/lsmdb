@@ -5,7 +5,10 @@ use std::time::Duration;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::server::ServerLimits;
+use crate::server::{
+    ServerAuthOptions, ServerLimits, ServerOptions, ServerRole, ServerSecurityOptions,
+    ServerTlsMode, ServerTlsOptions, StaticPasswordUser, StaticTokenPrincipal,
+};
 use crate::storage::compaction::{
     CompactionStrategy, LeveledCompactionConfig, TieredCompactionConfig,
 };
@@ -29,26 +32,15 @@ pub enum ConfigError {
     InvalidValue { field: &'static str, message: String },
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct LsmdbConfig {
     pub storage: StorageConfig,
     pub server: ServerConfig,
+    pub security: SecurityConfig,
     pub wal: WalConfig,
     pub sstable: SstableConfig,
     pub compaction: CompactionConfig,
-}
-
-impl Default for LsmdbConfig {
-    fn default() -> Self {
-        Self {
-            storage: StorageConfig::default(),
-            server: ServerConfig::default(),
-            wal: WalConfig::default(),
-            sstable: SstableConfig::default(),
-            compaction: CompactionConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -105,6 +97,100 @@ impl Default for ServerConfig {
             max_query_result_rows: defaults.max_query_result_rows,
             max_query_result_bytes: defaults.max_query_result_bytes,
             max_concurrent_queries_per_identity: defaults.max_concurrent_queries_per_identity,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct SecurityConfig {
+    pub auth: SecurityAuthConfig,
+    pub tls: SecurityTlsConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct SecurityAuthConfig {
+    pub mode: AuthModeConfig,
+    pub users: Vec<SecurityUserConfig>,
+    pub tokens: Vec<SecurityTokenConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthModeConfig {
+    #[default]
+    Disabled,
+    Password,
+    Token,
+}
+
+impl AuthModeConfig {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthModeConfig::Disabled => "disabled",
+            AuthModeConfig::Password => "password",
+            AuthModeConfig::Token => "token",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecurityUserConfig {
+    pub username: String,
+    pub password: String,
+    pub role: RoleConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecurityTokenConfig {
+    pub label: String,
+    pub token: String,
+    pub role: RoleConfig,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleConfig {
+    #[default]
+    Reader,
+    Writer,
+    Admin,
+}
+
+impl From<RoleConfig> for ServerRole {
+    fn from(value: RoleConfig) -> Self {
+        match value {
+            RoleConfig::Reader => ServerRole::Reader,
+            RoleConfig::Writer => ServerRole::Writer,
+            RoleConfig::Admin => ServerRole::Admin,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct SecurityTlsConfig {
+    pub mode: TlsModeConfig,
+    pub cert_path: Option<PathBuf>,
+    pub key_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsModeConfig {
+    #[default]
+    Disabled,
+    Required,
+}
+
+impl TlsModeConfig {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TlsModeConfig::Disabled => "disabled",
+            TlsModeConfig::Required => "required",
         }
     }
 }
@@ -186,22 +272,12 @@ impl Default for SstableConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct CompactionConfig {
     pub strategy: CompactionMode,
     pub leveled: LeveledConfig,
     pub tiered: TieredConfig,
-}
-
-impl Default for CompactionConfig {
-    fn default() -> Self {
-        Self {
-            strategy: CompactionMode::default(),
-            leveled: LeveledConfig::default(),
-            tiered: TieredConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
@@ -257,6 +333,7 @@ pub struct RuntimeConfig {
     pub storage_engine: StorageEngineOptions,
     pub compaction_strategy: CompactionStrategy,
     pub server_limits: ServerLimits,
+    pub server_security: ServerSecurityOptions,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -292,6 +369,12 @@ pub struct StartupDiagnostics {
     pub server_max_query_result_rows: usize,
     pub server_max_query_result_bytes: usize,
     pub server_max_concurrent_queries_per_identity: Option<usize>,
+    pub security_auth_mode: AuthModeConfig,
+    pub security_tls_mode: TlsModeConfig,
+    pub security_user_count: usize,
+    pub security_token_count: usize,
+    pub security_tls_cert_path: Option<String>,
+    pub security_tls_key_path: Option<String>,
     pub wal_segment_size_bytes: u64,
     pub wal_sync_mode: SyncModeConfig,
     pub sstable_data_block_size_bytes: usize,
@@ -334,6 +417,18 @@ impl StartupDiagnostics {
             format!(
                 "server.max_concurrent_queries_per_identity={}",
                 format_optional_usize(self.server_max_concurrent_queries_per_identity)
+            ),
+            format!("security.auth.mode={}", self.security_auth_mode.as_str()),
+            format!("security.tls.mode={}", self.security_tls_mode.as_str()),
+            format!("security.auth.users={}", self.security_user_count),
+            format!("security.auth.tokens={}", self.security_token_count),
+            format!(
+                "security.tls.cert_path={}",
+                format_optional_string(self.security_tls_cert_path.as_deref())
+            ),
+            format!(
+                "security.tls.key_path={}",
+                format_optional_string(self.security_tls_key_path.as_deref())
             ),
             format!("wal.segment_size_bytes={}", self.wal_segment_size_bytes),
             format!("wal.sync_mode={}", self.wal_sync_mode.as_str()),
@@ -456,6 +551,87 @@ impl LsmdbConfig {
                 "must be > 0 when set",
             ));
         }
+        match self.security.auth.mode {
+            AuthModeConfig::Disabled => {}
+            AuthModeConfig::Password => {
+                if self.security.auth.users.is_empty() {
+                    return Err(invalid(
+                        "security.auth.users",
+                        "must contain at least one user when auth mode is 'password'",
+                    ));
+                }
+                let mut seen = std::collections::BTreeSet::new();
+                for user in &self.security.auth.users {
+                    if user.username.trim().is_empty() {
+                        return Err(invalid("security.auth.users.username", "must not be empty"));
+                    }
+                    if user.password.is_empty() {
+                        return Err(invalid("security.auth.users.password", "must not be empty"));
+                    }
+                    if !seen.insert(user.username.as_str()) {
+                        return Err(invalid(
+                            "security.auth.users.username",
+                            format!("duplicate username '{}'", user.username),
+                        ));
+                    }
+                }
+            }
+            AuthModeConfig::Token => {
+                if self.security.auth.tokens.is_empty() {
+                    return Err(invalid(
+                        "security.auth.tokens",
+                        "must contain at least one token when auth mode is 'token'",
+                    ));
+                }
+                let mut labels = std::collections::BTreeSet::new();
+                let mut tokens = std::collections::BTreeSet::new();
+                for token in &self.security.auth.tokens {
+                    if token.label.trim().is_empty() {
+                        return Err(invalid("security.auth.tokens.label", "must not be empty"));
+                    }
+                    if token.token.is_empty() {
+                        return Err(invalid("security.auth.tokens.token", "must not be empty"));
+                    }
+                    if !labels.insert(token.label.as_str()) {
+                        return Err(invalid(
+                            "security.auth.tokens.label",
+                            format!("duplicate token label '{}'", token.label),
+                        ));
+                    }
+                    if !tokens.insert(token.token.as_str()) {
+                        return Err(invalid(
+                            "security.auth.tokens.token",
+                            format!("duplicate token value for '{}'", token.label),
+                        ));
+                    }
+                }
+            }
+        }
+        if self.security.auth.mode != AuthModeConfig::Disabled
+            && self.security.tls.mode != TlsModeConfig::Required
+        {
+            return Err(invalid(
+                "security.tls.mode",
+                "must be 'required' when authentication is enabled",
+            ));
+        }
+        match self.security.tls.mode {
+            TlsModeConfig::Disabled => {}
+            TlsModeConfig::Required => {
+                let cert_path = self.security.tls.cert_path.as_ref().ok_or_else(|| {
+                    invalid("security.tls.cert_path", "must be set when tls mode is 'required'")
+                })?;
+                let key_path = self.security.tls.key_path.as_ref().ok_or_else(|| {
+                    invalid("security.tls.key_path", "must be set when tls mode is 'required'")
+                })?;
+                if cert_path.as_os_str().is_empty() {
+                    return Err(invalid("security.tls.cert_path", "must not be empty"));
+                }
+                if key_path.as_os_str().is_empty() {
+                    return Err(invalid("security.tls.key_path", "must not be empty"));
+                }
+            }
+        }
         if self.wal.segment_size_bytes < MIN_WAL_SEGMENT_SIZE_BYTES {
             return Err(invalid(
                 "wal.segment_size_bytes",
@@ -533,6 +709,22 @@ impl LsmdbConfig {
             server_max_concurrent_queries_per_identity: runtime
                 .server_limits
                 .max_concurrent_queries_per_identity,
+            security_auth_mode: self.security.auth.mode,
+            security_tls_mode: self.security.tls.mode,
+            security_user_count: self.security.auth.users.len(),
+            security_token_count: self.security.auth.tokens.len(),
+            security_tls_cert_path: self
+                .security
+                .tls
+                .cert_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            security_tls_key_path: self
+                .security
+                .tls
+                .key_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
             wal_segment_size_bytes: storage.wal_options.segment_size_bytes,
             wal_sync_mode: SyncModeConfig::from(storage.wal_options.sync_mode),
             sstable_data_block_size_bytes: storage.sstable_builder_options.data_block_size_bytes,
@@ -550,6 +742,7 @@ impl LsmdbConfig {
             storage_engine: self.to_storage_engine_options_unchecked(),
             compaction_strategy: self.to_compaction_strategy_unchecked(),
             server_limits: self.to_server_limits_unchecked(),
+            server_security: self.to_server_security_options_unchecked(),
         })
     }
 
@@ -566,6 +759,19 @@ impl LsmdbConfig {
     pub fn to_server_limits(&self) -> Result<ServerLimits, ConfigError> {
         self.validate()?;
         Ok(self.to_server_limits_unchecked())
+    }
+
+    pub fn to_server_security_options(&self) -> Result<ServerSecurityOptions, ConfigError> {
+        self.validate()?;
+        Ok(self.to_server_security_options_unchecked())
+    }
+
+    pub fn to_server_options(&self) -> Result<ServerOptions, ConfigError> {
+        self.validate()?;
+        Ok(ServerOptions {
+            limits: self.to_server_limits_unchecked(),
+            security: self.to_server_security_options_unchecked(),
+        })
     }
 
     fn to_storage_engine_options_unchecked(&self) -> StorageEngineOptions {
@@ -624,6 +830,48 @@ impl LsmdbConfig {
             max_concurrent_queries_per_identity: self.server.max_concurrent_queries_per_identity,
         }
     }
+
+    fn to_server_security_options_unchecked(&self) -> ServerSecurityOptions {
+        let auth = match self.security.auth.mode {
+            AuthModeConfig::Disabled => ServerAuthOptions::Disabled,
+            AuthModeConfig::Password => ServerAuthOptions::StaticPassword {
+                users: self
+                    .security
+                    .auth
+                    .users
+                    .iter()
+                    .map(|user| StaticPasswordUser {
+                        username: user.username.clone(),
+                        password: user.password.clone(),
+                        role: user.role.into(),
+                    })
+                    .collect(),
+            },
+            AuthModeConfig::Token => ServerAuthOptions::StaticToken {
+                principals: self
+                    .security
+                    .auth
+                    .tokens
+                    .iter()
+                    .map(|token| StaticTokenPrincipal {
+                        label: token.label.clone(),
+                        token: token.token.clone(),
+                        role: token.role.into(),
+                    })
+                    .collect(),
+            },
+        };
+        let tls = ServerTlsOptions {
+            mode: match self.security.tls.mode {
+                TlsModeConfig::Disabled => ServerTlsMode::Disabled,
+                TlsModeConfig::Required => ServerTlsMode::Required,
+            },
+            cert_path: self.security.tls.cert_path.clone(),
+            key_path: self.security.tls.key_path.clone(),
+        };
+
+        ServerSecurityOptions { auth, tls, allow_anonymous_access: false }
+    }
 }
 
 fn invalid(field: &'static str, message: impl Into<String>) -> ConfigError {
@@ -636,6 +884,10 @@ fn format_optional_u64(value: Option<u64>) -> String {
 
 fn format_optional_usize(value: Option<usize>) -> String {
     value.map(|value| value.to_string()).unwrap_or_else(|| "none".to_string())
+}
+
+fn format_optional_string(value: Option<&str>) -> String {
+    value.map(str::to_string).unwrap_or_else(|| "none".to_string())
 }
 
 fn bloom_params_for_fpr(fpr: f64) -> (usize, u8) {
@@ -657,6 +909,11 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    const TLS_CERT_PATH: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tls/server.crt");
+    const TLS_KEY_PATH: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tls/server.key");
 
     fn temp_file_path(label: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
@@ -746,6 +1003,40 @@ mod tests {
     }
 
     #[test]
+    fn parses_and_maps_security_config() {
+        let raw = format!(
+            r#"
+                [security.auth]
+                mode = "password"
+
+                [[security.auth.users]]
+                username = "admin"
+                password = "secret"
+                role = "admin"
+
+                [security.tls]
+                mode = "required"
+                cert_path = "{TLS_CERT_PATH}"
+                key_path = "{TLS_KEY_PATH}"
+            "#
+        );
+
+        let config = LsmdbConfig::from_toml_str(&raw).expect("parse security config");
+        let options = config.to_server_options().expect("server options");
+        match options.security.auth {
+            ServerAuthOptions::StaticPassword { users } => {
+                assert_eq!(users.len(), 1);
+                assert_eq!(users[0].username, "admin");
+                assert_eq!(users[0].role, ServerRole::Admin);
+            }
+            other => panic!("expected static password auth, got {other:?}"),
+        }
+        assert_eq!(options.security.tls.mode, ServerTlsMode::Required);
+        assert_eq!(options.security.tls.cert_path.as_deref(), Some(Path::new(TLS_CERT_PATH)));
+        assert_eq!(options.security.tls.key_path.as_deref(), Some(Path::new(TLS_KEY_PATH)));
+    }
+
+    #[test]
     fn rejects_invalid_bloom_fpr() {
         let raw = r#"
             [sstable]
@@ -820,8 +1111,54 @@ mod tests {
     }
 
     #[test]
-    fn emits_startup_diagnostics_for_runtime_config() {
+    fn rejects_password_auth_without_users() {
         let raw = r#"
+            [security.auth]
+            mode = "password"
+        "#;
+
+        let err = LsmdbConfig::from_toml_str(raw).expect_err("missing users should fail");
+        assert!(
+            matches!(err, ConfigError::InvalidValue { field, .. } if field == "security.auth.users")
+        );
+    }
+
+    #[test]
+    fn rejects_password_auth_without_required_tls() {
+        let raw = r#"
+            [security.auth]
+            mode = "password"
+
+            [[security.auth.users]]
+            username = "admin"
+            password = "secret"
+            role = "admin"
+        "#;
+
+        let err = LsmdbConfig::from_toml_str(raw).expect_err("password auth should require tls");
+        assert!(
+            matches!(err, ConfigError::InvalidValue { field, .. } if field == "security.tls.mode")
+        );
+    }
+
+    #[test]
+    fn rejects_tls_required_without_key_path() {
+        let raw = r#"
+            [security.tls]
+            mode = "required"
+            cert_path = "./server.crt"
+        "#;
+
+        let err = LsmdbConfig::from_toml_str(raw).expect_err("missing key should fail");
+        assert!(
+            matches!(err, ConfigError::InvalidValue { field, .. } if field == "security.tls.key_path")
+        );
+    }
+
+    #[test]
+    fn emits_startup_diagnostics_for_runtime_config() {
+        let raw = format!(
+            r#"
             [storage]
             memtable_size_bytes = 8192
             memtable_arena_block_size_bytes = 4096
@@ -843,11 +1180,25 @@ mod tests {
             segment_size_bytes = 4096
             sync_mode = "on_commit"
 
+            [security.auth]
+            mode = "token"
+
+            [[security.auth.tokens]]
+            label = "ops-bot"
+            token = "opaque"
+            role = "writer"
+
+            [security.tls]
+            mode = "required"
+            cert_path = "{TLS_CERT_PATH}"
+            key_path = "{TLS_KEY_PATH}"
+
             [compaction]
             strategy = "leveled"
-        "#;
+        "#
+        );
 
-        let config = LsmdbConfig::from_toml_str(raw).expect("parse valid config");
+        let config = LsmdbConfig::from_toml_str(&raw).expect("parse valid config");
         let diagnostics = config.startup_diagnostics().expect("startup diagnostics");
         assert_eq!(diagnostics.memtable_size_bytes, 8192);
         assert_eq!(diagnostics.memtable_arena_block_size_bytes, 4096);
@@ -856,11 +1207,17 @@ mod tests {
         assert_eq!(diagnostics.server_max_concurrent_connections, 24);
         assert_eq!(diagnostics.server_max_request_bytes, 32_768);
         assert_eq!(diagnostics.server_max_query_result_rows, 16);
+        assert_eq!(diagnostics.security_auth_mode, AuthModeConfig::Token);
+        assert_eq!(diagnostics.security_tls_mode, TlsModeConfig::Required);
+        assert_eq!(diagnostics.security_user_count, 0);
+        assert_eq!(diagnostics.security_token_count, 1);
         assert_eq!(diagnostics.wal_segment_size_bytes, 4096);
         assert_eq!(diagnostics.wal_sync_mode, SyncModeConfig::OnCommit);
 
         let lines = diagnostics.as_key_value_lines();
         assert!(lines.iter().any(|line| line == "server.max_concurrent_connections=24"));
+        assert!(lines.iter().any(|line| line == "security.auth.mode=token"));
+        assert!(lines.iter().any(|line| line == "security.tls.mode=required"));
         assert!(lines.iter().any(|line| line == "compaction.strategy=leveled"));
         assert!(lines.iter().any(|line| line.starts_with("sstable.bloom_bits_per_key=")));
     }

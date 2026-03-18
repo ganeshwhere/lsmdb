@@ -1,14 +1,20 @@
 use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
+use std::io::BufReader;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use thiserror::Error;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::{ServerConfig as RustlsServerConfig, pki_types::PrivateKeyDer};
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::catalog::Catalog;
@@ -16,17 +22,138 @@ use crate::executor::governance::{ExecutionGovernance, StatementCancellation};
 use crate::executor::{ExecutionError, ExecutionLimits, ExecutionSession};
 use crate::mvcc::MvccStore;
 use crate::planner::{PhysicalPlan, PlannerError, plan_statement};
+use crate::sql::ast::Statement;
 use crate::sql::parser::{ParseError, parse_sql};
 use crate::sql::validator::{ValidationError, validate_statement};
 
 use super::protocol::{
-    ActiveStatementPayload, ActiveStatementsPayload, AdminStatusPayload, ErrorCode, ErrorPayload,
-    HealthPayload, PROTOCOL_VERSION, ProtocolError, ReadinessPayload, RequestFrame, RequestType,
-    ResponseFrame, ResponsePayload, StatementCancellationPayload, payload_from_execution_result,
+    ActiveStatementPayload, ActiveStatementsPayload, AdminStatusPayload, AuthenticationPayload,
+    AuthenticationRequest, ErrorCode, ErrorPayload, HealthPayload, PROTOCOL_VERSION, ProtocolError,
+    ReadinessPayload, RequestFrame, RequestType, ResponseFrame, ResponsePayload,
+    StatementCancellationPayload, decode_authentication_request, payload_from_execution_result,
     read_request_with_limit, write_response,
 };
 
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerRole {
+    Admin,
+    Writer,
+    Reader,
+}
+
+impl ServerRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ServerRole::Admin => "admin",
+            ServerRole::Writer => "writer",
+            ServerRole::Reader => "reader",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticPasswordUser {
+    pub username: String,
+    pub password: String,
+    pub role: ServerRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticTokenPrincipal {
+    pub label: String,
+    pub token: String,
+    pub role: ServerRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ServerAuthOptions {
+    #[default]
+    Disabled,
+    StaticPassword {
+        users: Vec<StaticPasswordUser>,
+    },
+    StaticToken {
+        principals: Vec<StaticTokenPrincipal>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ServerTlsMode {
+    #[default]
+    Disabled,
+    Required,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ServerTlsOptions {
+    pub mode: ServerTlsMode,
+    pub cert_path: Option<PathBuf>,
+    pub key_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ServerSecurityOptions {
+    pub auth: ServerAuthOptions,
+    pub tls: ServerTlsOptions,
+    pub allow_anonymous_access: bool,
+}
+
+impl ServerSecurityOptions {
+    pub fn anonymous_for_local_dev() -> Self {
+        Self { allow_anonymous_access: true, ..Self::default() }
+    }
+
+    fn validate(&self) -> Result<(), ServerError> {
+        match &self.auth {
+            ServerAuthOptions::Disabled => {}
+            ServerAuthOptions::StaticPassword { users } => {
+                if users.is_empty() {
+                    return Err(ServerError::InvalidConfiguration(
+                        "password authentication requires at least one user".to_string(),
+                    ));
+                }
+            }
+            ServerAuthOptions::StaticToken { principals } => {
+                if principals.is_empty() {
+                    return Err(ServerError::InvalidConfiguration(
+                        "token authentication requires at least one token principal".to_string(),
+                    ));
+                }
+            }
+        }
+
+        if !matches!(self.auth, ServerAuthOptions::Disabled)
+            && self.tls.mode != ServerTlsMode::Required
+        {
+            return Err(ServerError::InvalidConfiguration(
+                "authentication requires tls mode 'required'".to_string(),
+            ));
+        }
+        if matches!(self.auth, ServerAuthOptions::Disabled) && !self.allow_anonymous_access {
+            return Err(ServerError::InvalidConfiguration(
+                "authentication is disabled; set allow_anonymous_access only for local development or tests"
+                    .to_string(),
+            ));
+        }
+
+        if self.tls.mode == ServerTlsMode::Required {
+            if self.tls.cert_path.is_none() {
+                return Err(ServerError::InvalidConfiguration(
+                    "tls mode 'required' needs a certificate path".to_string(),
+                ));
+            }
+            if self.tls.key_path.is_none() {
+                return Err(ServerError::InvalidConfiguration(
+                    "tls mode 'required' needs a private key path".to_string(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServerLimits {
@@ -110,9 +237,16 @@ impl ServerLimits {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ServerOptions {
     pub limits: ServerLimits,
+    pub security: ServerSecurityOptions,
+}
+
+impl ServerOptions {
+    pub fn insecure_for_local_dev() -> Self {
+        Self { security: ServerSecurityOptions::anonymous_for_local_dev(), ..Self::default() }
+    }
 }
 
 #[derive(Debug)]
@@ -132,6 +266,7 @@ struct ServerRuntimeState {
     active_statements: Mutex<BTreeMap<u64, ActiveStatementEntry>>,
     identity_query_counts: Mutex<HashMap<String, usize>>,
     limits: ServerLimits,
+    security: ServerSecurityOptions,
     connection_slots: Arc<Semaphore>,
     memory_intensive_slots: Arc<Semaphore>,
 }
@@ -154,6 +289,7 @@ impl ServerRuntimeState {
             active_statements: Mutex::new(BTreeMap::new()),
             identity_query_counts: Mutex::new(HashMap::new()),
             limits: options.limits,
+            security: options.security,
             connection_slots: Arc::new(Semaphore::new(options.limits.max_concurrent_connections)),
             memory_intensive_slots: Arc::new(Semaphore::new(
                 options.limits.max_memory_intensive_requests,
@@ -200,18 +336,6 @@ impl ServerRuntimeState {
         request_type: RequestType,
         sql: &str,
     ) -> Result<StatementExecutionGuard, RequestError> {
-        if let Some(limit) = self.limits.max_concurrent_queries_per_identity {
-            let mut counts = self.identity_query_counts.lock();
-            let current = counts.get(identity).copied().unwrap_or(0);
-            if current >= limit {
-                drop(counts);
-                return Err(RequestError::Quota(format!(
-                    "identity '{identity}' exceeded concurrent query quota ({limit})"
-                )));
-            }
-            counts.insert(identity.to_string(), current + 1);
-        }
-
         let statement_id = self.next_statement_id.fetch_add(1, Ordering::Relaxed);
         let cancellation = StatementCancellation::new();
         let entry = ActiveStatementEntry {
@@ -233,8 +357,30 @@ impl ServerRuntimeState {
         })
     }
 
-    fn finish_statement(&self, statement_id: u64, identity: &str) {
+    fn begin_identity_query(
+        self: &Arc<Self>,
+        identity: &str,
+    ) -> Result<IdentityQueryGuard, RequestError> {
+        if let Some(limit) = self.limits.max_concurrent_queries_per_identity {
+            let mut counts = self.identity_query_counts.lock();
+            let current = counts.get(identity).copied().unwrap_or(0);
+            if current >= limit {
+                drop(counts);
+                return Err(RequestError::Quota(format!(
+                    "identity '{identity}' exceeded concurrent query quota ({limit})"
+                )));
+            }
+            counts.insert(identity.to_string(), current + 1);
+        }
+
+        Ok(IdentityQueryGuard { runtime_state: Arc::clone(self), identity: identity.to_string() })
+    }
+
+    fn finish_statement(&self, statement_id: u64, _identity: &str) {
         self.active_statements.lock().remove(&statement_id);
+    }
+
+    fn finish_identity_query(&self, identity: &str) {
         if self.limits.max_concurrent_queries_per_identity.is_some() {
             let mut counts = self.identity_query_counts.lock();
             if let Some(current) = counts.get_mut(identity) {
@@ -322,6 +468,18 @@ impl Drop for StatementExecutionGuard {
 }
 
 #[derive(Debug)]
+struct IdentityQueryGuard {
+    runtime_state: Arc<ServerRuntimeState>,
+    identity: String,
+}
+
+impl Drop for IdentityQueryGuard {
+    fn drop(&mut self) {
+        self.runtime_state.finish_identity_query(&self.identity);
+    }
+}
+
+#[derive(Debug)]
 struct ConnectionGuard {
     runtime_state: Arc<ServerRuntimeState>,
     _permit: OwnedSemaphorePermit,
@@ -368,12 +526,23 @@ impl Drop for MemoryIntensiveRequestGuard {
 struct ConnectionContext {
     request_slots: Arc<Semaphore>,
     connection_id: u64,
-    identity: String,
+    principal: AuthenticatedPrincipal,
+    peer_identity: String,
 }
 
 impl ConnectionContext {
-    fn new(limit: usize, connection_id: u64, identity: String) -> Self {
-        Self { request_slots: Arc::new(Semaphore::new(limit)), connection_id, identity }
+    fn new(
+        limit: usize,
+        connection_id: u64,
+        peer_identity: String,
+        principal: AuthenticatedPrincipal,
+    ) -> Self {
+        Self {
+            request_slots: Arc::new(Semaphore::new(limit)),
+            connection_id,
+            principal,
+            peer_identity,
+        }
     }
 
     fn try_acquire_request_slot(&self) -> Option<ConnectionRequestGuard> {
@@ -383,6 +552,21 @@ impl ConnectionContext {
             .ok()
             .map(|permit| ConnectionRequestGuard { _permit: permit })
     }
+
+    fn identity(&self) -> &str {
+        &self.principal.identity
+    }
+
+    fn role(&self) -> ServerRole {
+        self.principal.role
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AuthenticatedPrincipal {
+    identity: String,
+    role: ServerRole,
+    auth_scheme: &'static str,
 }
 
 #[derive(Debug, Error)]
@@ -391,6 +575,8 @@ pub enum ServerError {
     Io(#[from] std::io::Error),
     #[error("protocol error: {0}")]
     Protocol(#[from] ProtocolError),
+    #[error("TLS error: {0}")]
+    Tls(String),
     #[error("invalid server configuration: {0}")]
     InvalidConfiguration(String),
     #[error("accept loop task failed: {0}")]
@@ -407,6 +593,10 @@ enum RequestError {
     ResourceLimit(String),
     #[error("quota exceeded: {0}")]
     Quota(String),
+    #[error("unauthenticated: {0}")]
+    Unauthenticated(String),
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
     #[error("parse error: {0}")]
     Parse(#[from] ParseError),
     #[error("validation error: {0}")]
@@ -428,6 +618,12 @@ impl RequestError {
                 ErrorPayload::new(ErrorCode::ResourceLimit, message, false)
             }
             RequestError::Quota(message) => ErrorPayload::new(ErrorCode::Quota, message, true),
+            RequestError::Unauthenticated(message) => {
+                ErrorPayload::new(ErrorCode::Unauthenticated, message, false)
+            }
+            RequestError::PermissionDenied(message) => {
+                ErrorPayload::new(ErrorCode::PermissionDenied, message, false)
+            }
             RequestError::Parse(error) => {
                 ErrorPayload::new(ErrorCode::Parse, error.to_string(), false)
             }
@@ -450,6 +646,219 @@ impl RequestError {
                 _ => ErrorPayload::new(ErrorCode::Execution, error.to_string(), false),
             },
         }
+    }
+}
+
+fn load_tls_acceptor(options: &ServerTlsOptions) -> Result<Option<TlsAcceptor>, ServerError> {
+    if options.mode == ServerTlsMode::Disabled {
+        return Ok(None);
+    }
+
+    let cert_path = options.cert_path.as_ref().ok_or_else(|| {
+        ServerError::InvalidConfiguration(
+            "tls mode 'required' needs a certificate path".to_string(),
+        )
+    })?;
+    let key_path = options.key_path.as_ref().ok_or_else(|| {
+        ServerError::InvalidConfiguration(
+            "tls mode 'required' needs a private key path".to_string(),
+        )
+    })?;
+
+    let mut cert_reader = BufReader::new(File::open(cert_path).map_err(|err| {
+        ServerError::Tls(format!("failed to open TLS certificate '{}': {err}", cert_path.display()))
+    })?);
+    let certificates =
+        rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>().map_err(|err| {
+            ServerError::Tls(format!(
+                "failed to parse TLS certificate '{}': {err}",
+                cert_path.display()
+            ))
+        })?;
+    if certificates.is_empty() {
+        return Err(ServerError::Tls(format!(
+            "TLS certificate '{}' did not contain any certificate entries",
+            cert_path.display()
+        )));
+    }
+
+    let mut key_reader = BufReader::new(File::open(key_path).map_err(|err| {
+        ServerError::Tls(format!("failed to open TLS private key '{}': {err}", key_path.display()))
+    })?);
+    let private_key = rustls_pemfile::private_key(&mut key_reader)
+        .map_err(|err| {
+            ServerError::Tls(format!(
+                "failed to parse TLS private key '{}': {err}",
+                key_path.display()
+            ))
+        })?
+        .ok_or_else(|| {
+            ServerError::Tls(format!(
+                "TLS private key '{}' did not contain a supported key",
+                key_path.display()
+            ))
+        })?;
+
+    let config = build_tls_server_config(certificates, private_key)?;
+    Ok(Some(TlsAcceptor::from(Arc::new(config))))
+}
+
+fn build_tls_server_config(
+    certificates: Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>>,
+    private_key: PrivateKeyDer<'static>,
+) -> Result<RustlsServerConfig, ServerError> {
+    RustlsServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certificates, private_key)
+        .map_err(|err| ServerError::Tls(format!("failed to build TLS server config: {err}")))
+}
+
+async fn perform_authentication_handshake<S>(
+    stream: &mut S,
+    runtime_state: &Arc<ServerRuntimeState>,
+    connection_id: u64,
+    peer_identity: &str,
+) -> Result<Option<AuthenticatedPrincipal>, ServerError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match &runtime_state.security.auth {
+        ServerAuthOptions::Disabled => Ok(Some(AuthenticatedPrincipal {
+            identity: peer_identity.to_string(),
+            role: ServerRole::Admin,
+            auth_scheme: "disabled",
+        })),
+        auth_options => {
+            let request = match read_request_with_limit(
+                stream,
+                runtime_state.limits.max_request_bytes,
+            )
+            .await
+            {
+                Ok(Some(request)) => request,
+                Ok(None) => return Ok(None),
+                Err(ProtocolError::FrameTooLarge { length, max }) => {
+                    runtime_state.record_resource_limit_request();
+                    let response = ResponseFrame::Err(ErrorPayload::new(
+                        ErrorCode::ResourceLimit,
+                        format!(
+                            "authentication frame too large: {length} bytes exceeds limit {max} bytes"
+                        ),
+                        false,
+                    ));
+                    let _ = write_response(stream, &response).await;
+                    return Ok(None);
+                }
+                Err(err) => return Err(ServerError::Protocol(err)),
+            };
+
+            if request.request_type != RequestType::Authenticate {
+                warn!(
+                    connection_id,
+                    peer_identity,
+                    request_type = ?request.request_type,
+                    "rejecting unauthenticated request before session authentication"
+                );
+                let response = ResponseFrame::Err(ErrorPayload::new(
+                    ErrorCode::Unauthenticated,
+                    "secure mode requires authentication before any other request".to_string(),
+                    false,
+                ));
+                let _ = write_response(stream, &response).await;
+                return Ok(None);
+            }
+
+            let auth_request = match decode_authentication_request(&request.sql) {
+                Ok(request) => request,
+                Err(message) => {
+                    warn!(connection_id, peer_identity, error = %message, "invalid authentication payload");
+                    let response = ResponseFrame::Err(ErrorPayload::new(
+                        ErrorCode::InvalidRequest,
+                        message,
+                        false,
+                    ));
+                    let _ = write_response(stream, &response).await;
+                    return Ok(None);
+                }
+            };
+
+            match authenticate_principal(auth_options, auth_request) {
+                Ok(principal) => {
+                    info!(
+                        connection_id,
+                        peer_identity,
+                        identity = %principal.identity,
+                        role = principal.role.as_str(),
+                        auth_scheme = principal.auth_scheme,
+                        "authenticated connection"
+                    );
+                    let response =
+                        ResponseFrame::Ok(ResponsePayload::Authentication(AuthenticationPayload {
+                            identity: principal.identity.clone(),
+                            role: principal.role.as_str().to_string(),
+                            auth_scheme: principal.auth_scheme.to_string(),
+                        }));
+                    write_response(stream, &response).await?;
+                    Ok(Some(principal))
+                }
+                Err(err) => {
+                    warn!(connection_id, peer_identity, error = %err, "authentication failed");
+                    let response = ResponseFrame::Err(err.into_error_payload());
+                    let _ = write_response(stream, &response).await;
+                    Ok(None)
+                }
+            }
+        }
+    }
+}
+
+fn authenticate_principal(
+    auth_options: &ServerAuthOptions,
+    request: AuthenticationRequest,
+) -> Result<AuthenticatedPrincipal, RequestError> {
+    match (auth_options, request) {
+        (
+            ServerAuthOptions::StaticPassword { users },
+            AuthenticationRequest::Password { username, password },
+        ) => {
+            let user = users
+                .iter()
+                .find(|user| user.username == username && user.password == password)
+                .ok_or_else(|| {
+                    RequestError::Unauthenticated(
+                        "invalid username or password for secure server".to_string(),
+                    )
+                })?;
+            Ok(AuthenticatedPrincipal {
+                identity: user.username.clone(),
+                role: user.role,
+                auth_scheme: "password",
+            })
+        }
+        (ServerAuthOptions::StaticToken { principals }, AuthenticationRequest::Token { token }) => {
+            let principal =
+                principals.iter().find(|principal| principal.token == token).ok_or_else(|| {
+                    RequestError::Unauthenticated("invalid token for secure server".to_string())
+                })?;
+            Ok(AuthenticatedPrincipal {
+                identity: principal.label.clone(),
+                role: principal.role,
+                auth_scheme: "token",
+            })
+        }
+        (ServerAuthOptions::StaticPassword { .. }, AuthenticationRequest::Token { .. }) => {
+            Err(RequestError::Unauthenticated(
+                "secure server expects password authentication".to_string(),
+            ))
+        }
+        (ServerAuthOptions::StaticToken { .. }, AuthenticationRequest::Password { .. }) => Err(
+            RequestError::Unauthenticated("secure server expects token authentication".to_string()),
+        ),
+        (ServerAuthOptions::Disabled, _) => Ok(AuthenticatedPrincipal {
+            identity: "anonymous".to_string(),
+            role: ServerRole::Admin,
+            auth_scheme: "disabled",
+        }),
     }
 }
 
@@ -495,6 +904,8 @@ pub async fn start_server_with_options(
     options: ServerOptions,
 ) -> Result<ServerHandle, ServerError> {
     options.limits.validate()?;
+    options.security.validate()?;
+    let tls_acceptor = load_tls_acceptor(&options.security.tls)?;
     info!(%bind_addr, "starting tcp server");
     let listener = TcpListener::bind(bind_addr).await?;
     let local_addr = listener.local_addr()?;
@@ -503,7 +914,7 @@ pub async fn start_server_with_options(
     let runtime_state = Arc::new(ServerRuntimeState::new(options));
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
-        run_accept_loop(listener, catalog, store, runtime_state, shutdown_rx).await
+        run_accept_loop(listener, catalog, store, runtime_state, tls_acceptor, shutdown_rx).await
     });
 
     Ok(ServerHandle { local_addr, shutdown_tx: Some(shutdown_tx), task: Some(task) })
@@ -514,6 +925,7 @@ async fn run_accept_loop(
     catalog: Arc<Catalog>,
     store: Arc<MvccStore>,
     runtime_state: Arc<ServerRuntimeState>,
+    tls_acceptor: Option<TlsAcceptor>,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) -> Result<(), ServerError> {
     loop {
@@ -526,7 +938,7 @@ async fn run_accept_loop(
             accept_result = listener.accept() => {
                 let (mut stream, peer_addr) = accept_result?;
                 let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-                let identity = peer_addr.ip().to_string();
+                let peer_identity = peer_addr.ip().to_string();
                 runtime_state.total_connections.fetch_add(1, Ordering::Relaxed);
                 let Some(connection_permit) = runtime_state.try_acquire_connection() else {
                     runtime_state.record_rejected_connection();
@@ -551,19 +963,39 @@ async fn run_accept_loop(
                 let catalog = Arc::clone(&catalog);
                 let store = Arc::clone(&store);
                 let runtime_state = Arc::clone(&runtime_state);
+                let tls_acceptor = tls_acceptor.clone();
                 let span = info_span!("connection", connection_id, %peer_addr);
                 tokio::spawn(async move {
-                    if let Err(err) = handle_connection(
-                        stream,
-                        catalog,
-                        store,
-                        runtime_state,
-                        connection_permit,
-                        connection_id,
-                        identity,
-                    )
-                    .await
-                    {
+                    let result = if let Some(acceptor) = tls_acceptor {
+                        match acceptor.accept(stream).await {
+                            Ok(tls_stream) => {
+                                handle_connection(
+                                    tls_stream,
+                                    catalog,
+                                    store,
+                                    runtime_state,
+                                    connection_permit,
+                                    connection_id,
+                                    peer_identity,
+                                )
+                                .await
+                            }
+                            Err(err) => Err(ServerError::Tls(err.to_string())),
+                        }
+                    } else {
+                        handle_connection(
+                            stream,
+                            catalog,
+                            store,
+                            runtime_state,
+                            connection_permit,
+                            connection_id,
+                            peer_identity,
+                        )
+                        .await
+                    };
+
+                    if let Err(err) = result {
                         warn!(error = %err, "connection task failed");
                     }
                 }.instrument(span));
@@ -574,20 +1006,34 @@ async fn run_accept_loop(
     Ok(())
 }
 
-async fn handle_connection(
-    mut stream: TcpStream,
+async fn handle_connection<S>(
+    mut stream: S,
     catalog: Arc<Catalog>,
     store: Arc<MvccStore>,
     runtime_state: Arc<ServerRuntimeState>,
     connection_permit: OwnedSemaphorePermit,
     connection_id: u64,
-    identity: String,
-) -> Result<(), ServerError> {
+    peer_identity: String,
+) -> Result<(), ServerError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let _connection_guard = ConnectionGuard::new(Arc::clone(&runtime_state), connection_permit);
+    let Some(principal) = perform_authentication_handshake(
+        &mut stream,
+        &runtime_state,
+        connection_id,
+        &peer_identity,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
     let connection_context = ConnectionContext::new(
         runtime_state.limits.max_in_flight_requests_per_connection,
         connection_id,
-        identity,
+        peer_identity,
+        principal,
     );
     let mut session = ExecutionSession::with_limits(
         catalog.as_ref(),
@@ -640,6 +1086,28 @@ async fn handle_connection(
         let sql_len = request.sql.len();
         debug!(request_type = ?request_type, sql_len, "received request frame");
 
+        let identity_query_guard =
+            if matches!(request_type, RequestType::Query | RequestType::Explain) {
+                match runtime_state.begin_identity_query(connection_context.identity()) {
+                    Ok(guard) => Some(guard),
+                    Err(err) => {
+                        warn!(request_type = ?request_type, error = %err, "request failed");
+                        let payload = err.into_error_payload();
+                        if payload.code == ErrorCode::Quota {
+                            runtime_state.record_quota_rejection();
+                        }
+                        let response = ResponseFrame::Err(payload);
+                        if let Err(err) = write_response(&mut stream, &response).await {
+                            error!(error = %err, "failed to write response");
+                            return Err(ServerError::Protocol(err));
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+
         let response = match execute_request(
             &mut session,
             &catalog,
@@ -678,6 +1146,7 @@ async fn handle_connection(
             error!(error = %err, "failed to write response");
             return Err(ServerError::Protocol(err));
         }
+        drop(identity_query_guard);
     }
 }
 
@@ -699,7 +1168,7 @@ fn execute_request(
             }
             let statement = runtime_state.begin_statement(
                 connection_context.connection_id,
-                &connection_context.identity,
+                connection_context.identity(),
                 RequestType::Query,
                 &request.sql,
             )?;
@@ -707,6 +1176,7 @@ fn execute_request(
                 session,
                 catalog,
                 runtime_state,
+                connection_context,
                 &request.sql,
                 &statement.governance(runtime_state.limits.statement_timeout_ms),
             )
@@ -715,42 +1185,60 @@ fn execute_request(
             session,
             catalog,
             runtime_state,
+            connection_context,
             "BEGIN ISOLATION LEVEL SNAPSHOT",
             &ExecutionGovernance::default(),
         ),
-        RequestType::Commit => {
-            execute_sql(session, catalog, runtime_state, "COMMIT", &ExecutionGovernance::default())
-        }
+        RequestType::Commit => execute_sql(
+            session,
+            catalog,
+            runtime_state,
+            connection_context,
+            "COMMIT",
+            &ExecutionGovernance::default(),
+        ),
         RequestType::Rollback => execute_sql(
             session,
             catalog,
             runtime_state,
+            connection_context,
             "ROLLBACK",
             &ExecutionGovernance::default(),
         ),
         RequestType::Explain => {
             let statement = runtime_state.begin_statement(
                 connection_context.connection_id,
-                &connection_context.identity,
+                connection_context.identity(),
                 RequestType::Explain,
                 &request.sql,
             )?;
             explain_sql(
                 catalog,
                 runtime_state,
+                connection_context,
                 &request.sql,
                 &statement.governance(runtime_state.limits.statement_timeout_ms),
             )
         }
         RequestType::Health => Ok(health_payload()),
         RequestType::Readiness => Ok(readiness_payload(runtime_state)),
-        RequestType::AdminStatus => Ok(admin_status_payload(store, runtime_state.as_ref())),
+        RequestType::AdminStatus => {
+            authorize_admin_request(connection_context, "admin status")?;
+            Ok(admin_status_payload(store, runtime_state.as_ref()))
+        }
         RequestType::ActiveStatements => {
+            authorize_admin_request(connection_context, "active statements")?;
             Ok(ResponsePayload::ActiveStatements(ActiveStatementsPayload {
                 statements: runtime_state.active_statement_payloads(),
             }))
         }
-        RequestType::CancelStatement => cancel_statement(runtime_state, &request.sql),
+        RequestType::CancelStatement => {
+            authorize_admin_request(connection_context, "statement cancellation")?;
+            cancel_statement(runtime_state, &request.sql)
+        }
+        RequestType::Authenticate => {
+            Err(RequestError::InvalidRequest("connection is already authenticated".to_string()))
+        }
     }
 }
 
@@ -758,11 +1246,13 @@ fn execute_sql(
     session: &mut ExecutionSession<'_>,
     catalog: &Catalog,
     runtime_state: &Arc<ServerRuntimeState>,
+    connection_context: &ConnectionContext,
     sql: &str,
     governance: &ExecutionGovernance,
 ) -> Result<super::protocol::ResponsePayload, RequestError> {
     governance.checkpoint()?;
     let statements = parse_sql(sql)?;
+    authorize_sql_statements(connection_context, &statements)?;
     if statements.len() > runtime_state.limits.max_statements_per_request {
         return Err(RequestError::ResourceLimit(format!(
             "request contains {} statements, limit is {}",
@@ -803,6 +1293,7 @@ fn execute_sql(
 fn explain_sql(
     catalog: &Catalog,
     runtime_state: &Arc<ServerRuntimeState>,
+    connection_context: &ConnectionContext,
     sql: &str,
     governance: &ExecutionGovernance,
 ) -> Result<ResponsePayload, RequestError> {
@@ -819,6 +1310,7 @@ fn explain_sql(
             "SQL payload produced no executable statement".to_string(),
         ));
     }
+    authorize_sql_statements(connection_context, &statements)?;
     if statements.len() > runtime_state.limits.max_statements_per_request {
         return Err(RequestError::ResourceLimit(format!(
             "request contains {} statements, limit is {}",
@@ -859,6 +1351,89 @@ fn readiness_payload(runtime_state: &Arc<ServerRuntimeState>) -> ResponsePayload
     let ready = runtime_state.accepting_connections.load(Ordering::Relaxed);
     let status = if ready { "ready" } else { "draining" };
     ResponsePayload::Readiness(ReadinessPayload { ready, status: status.to_string() })
+}
+
+fn authorize_admin_request(
+    connection_context: &ConnectionContext,
+    operation: &str,
+) -> Result<(), RequestError> {
+    if connection_context.role() == ServerRole::Admin {
+        return Ok(());
+    }
+
+    warn!(
+        connection_id = connection_context.connection_id,
+        peer_identity = %connection_context.peer_identity,
+        identity = %connection_context.identity(),
+        role = connection_context.role().as_str(),
+        operation,
+        "authorization denied for admin-only request"
+    );
+    Err(RequestError::PermissionDenied(format!(
+        "role '{}' cannot access {operation}",
+        connection_context.role().as_str()
+    )))
+}
+
+fn authorize_sql_statements(
+    connection_context: &ConnectionContext,
+    statements: &[Statement],
+) -> Result<(), RequestError> {
+    for statement in statements {
+        if role_allows_statement(connection_context.role(), statement) {
+            continue;
+        }
+
+        warn!(
+            connection_id = connection_context.connection_id,
+            peer_identity = %connection_context.peer_identity,
+            identity = %connection_context.identity(),
+            role = connection_context.role().as_str(),
+            statement_kind = statement_kind(statement),
+            "authorization denied for SQL statement"
+        );
+        return Err(RequestError::PermissionDenied(format!(
+            "role '{}' cannot execute {} statements",
+            connection_context.role().as_str(),
+            statement_kind(statement)
+        )));
+    }
+
+    Ok(())
+}
+
+fn role_allows_statement(role: ServerRole, statement: &Statement) -> bool {
+    match role {
+        ServerRole::Admin => true,
+        ServerRole::Writer => matches!(
+            statement,
+            Statement::Insert(_)
+                | Statement::Select(_)
+                | Statement::Update(_)
+                | Statement::Delete(_)
+                | Statement::Begin(_)
+                | Statement::Commit
+                | Statement::Rollback
+        ),
+        ServerRole::Reader => matches!(
+            statement,
+            Statement::Select(_) | Statement::Begin(_) | Statement::Commit | Statement::Rollback
+        ),
+    }
+}
+
+fn statement_kind(statement: &Statement) -> &'static str {
+    match statement {
+        Statement::CreateTable(_) => "CREATE TABLE",
+        Statement::DropTable(_) => "DROP TABLE",
+        Statement::Insert(_) => "INSERT",
+        Statement::Select(_) => "SELECT",
+        Statement::Update(_) => "UPDATE",
+        Statement::Delete(_) => "DELETE",
+        Statement::Begin(_) => "BEGIN",
+        Statement::Commit => "COMMIT",
+        Statement::Rollback => "ROLLBACK",
+    }
 }
 
 fn acquire_memory_intensive_guard(
@@ -929,6 +1504,7 @@ fn request_type_name(request_type: RequestType) -> &'static str {
         RequestType::AdminStatus => "ADMIN_STATUS",
         RequestType::ActiveStatements => "ACTIVE_STATEMENTS",
         RequestType::CancelStatement => "CANCEL_STATEMENT",
+        RequestType::Authenticate => "AUTHENTICATE",
     }
 }
 
