@@ -5,6 +5,10 @@ use std::time::Duration;
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::server::{
+    ServerAuthOptions, ServerLimits, ServerOptions, ServerRole, ServerSecurityOptions,
+    ServerTlsMode, ServerTlsOptions, StaticPasswordUser, StaticTokenPrincipal,
+};
 use crate::storage::compaction::{
     CompactionStrategy, LeveledCompactionConfig, TieredCompactionConfig,
 };
@@ -28,24 +32,15 @@ pub enum ConfigError {
     InvalidValue { field: &'static str, message: String },
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct LsmdbConfig {
     pub storage: StorageConfig,
+    pub server: ServerConfig,
+    pub security: SecurityConfig,
     pub wal: WalConfig,
     pub sstable: SstableConfig,
     pub compaction: CompactionConfig,
-}
-
-impl Default for LsmdbConfig {
-    fn default() -> Self {
-        Self {
-            storage: StorageConfig::default(),
-            wal: WalConfig::default(),
-            sstable: SstableConfig::default(),
-            compaction: CompactionConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -65,6 +60,137 @@ impl Default for StorageConfig {
             memtable_arena_block_size_bytes: defaults.memtable_arena_block_size_bytes,
             flush_poll_interval_ms: defaults.flush_poll_interval.as_millis() as u64,
             flush_timeout_ms: defaults.flush_timeout.as_millis() as u64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServerConfig {
+    pub max_concurrent_connections: usize,
+    pub max_in_flight_requests_per_connection: usize,
+    pub max_request_bytes: usize,
+    pub max_statements_per_request: usize,
+    pub statement_timeout_ms: Option<u64>,
+    pub max_memory_intensive_requests: usize,
+    pub max_scan_rows: usize,
+    pub max_sort_rows: usize,
+    pub max_join_rows: usize,
+    pub max_query_result_rows: usize,
+    pub max_query_result_bytes: usize,
+    pub max_concurrent_queries_per_identity: Option<usize>,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        let defaults = ServerLimits::default();
+        Self {
+            max_concurrent_connections: defaults.max_concurrent_connections,
+            max_in_flight_requests_per_connection: defaults.max_in_flight_requests_per_connection,
+            max_request_bytes: defaults.max_request_bytes,
+            max_statements_per_request: defaults.max_statements_per_request,
+            statement_timeout_ms: defaults.statement_timeout_ms,
+            max_memory_intensive_requests: defaults.max_memory_intensive_requests,
+            max_scan_rows: defaults.max_scan_rows,
+            max_sort_rows: defaults.max_sort_rows,
+            max_join_rows: defaults.max_join_rows,
+            max_query_result_rows: defaults.max_query_result_rows,
+            max_query_result_bytes: defaults.max_query_result_bytes,
+            max_concurrent_queries_per_identity: defaults.max_concurrent_queries_per_identity,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct SecurityConfig {
+    pub auth: SecurityAuthConfig,
+    pub tls: SecurityTlsConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct SecurityAuthConfig {
+    pub mode: AuthModeConfig,
+    pub users: Vec<SecurityUserConfig>,
+    pub tokens: Vec<SecurityTokenConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthModeConfig {
+    #[default]
+    Disabled,
+    Password,
+    Token,
+}
+
+impl AuthModeConfig {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthModeConfig::Disabled => "disabled",
+            AuthModeConfig::Password => "password",
+            AuthModeConfig::Token => "token",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecurityUserConfig {
+    pub username: String,
+    pub password: String,
+    pub role: RoleConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecurityTokenConfig {
+    pub label: String,
+    pub token: String,
+    pub role: RoleConfig,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleConfig {
+    #[default]
+    Reader,
+    Writer,
+    Admin,
+}
+
+impl From<RoleConfig> for ServerRole {
+    fn from(value: RoleConfig) -> Self {
+        match value {
+            RoleConfig::Reader => ServerRole::Reader,
+            RoleConfig::Writer => ServerRole::Writer,
+            RoleConfig::Admin => ServerRole::Admin,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct SecurityTlsConfig {
+    pub mode: TlsModeConfig,
+    pub cert_path: Option<PathBuf>,
+    pub key_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsModeConfig {
+    #[default]
+    Disabled,
+    Required,
+}
+
+impl TlsModeConfig {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TlsModeConfig::Disabled => "disabled",
+            TlsModeConfig::Required => "required",
         }
     }
 }
@@ -114,6 +240,16 @@ impl From<SyncMode> for SyncModeConfig {
     }
 }
 
+impl SyncModeConfig {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SyncModeConfig::Never => "never",
+            SyncModeConfig::OnCommit => "on_commit",
+            SyncModeConfig::Always => "always",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SstableConfig {
@@ -136,22 +272,12 @@ impl Default for SstableConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct CompactionConfig {
     pub strategy: CompactionMode,
     pub leveled: LeveledConfig,
     pub tiered: TieredConfig,
-}
-
-impl Default for CompactionConfig {
-    fn default() -> Self {
-        Self {
-            strategy: CompactionMode::default(),
-            leveled: LeveledConfig::default(),
-            tiered: TieredConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
@@ -206,6 +332,145 @@ impl Default for TieredConfig {
 pub struct RuntimeConfig {
     pub storage_engine: StorageEngineOptions,
     pub compaction_strategy: CompactionStrategy,
+    pub server_limits: ServerLimits,
+    pub server_security: ServerSecurityOptions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactionDiagnostics {
+    Leveled {
+        level0_file_limit: usize,
+        level_size_base_bytes: u64,
+        level_size_multiplier: u64,
+        max_levels: u32,
+    },
+    Tiered {
+        max_components_per_tier: usize,
+        min_tier_size_bytes: u64,
+        output_level: u32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupDiagnostics {
+    pub memtable_size_bytes: usize,
+    pub memtable_arena_block_size_bytes: usize,
+    pub flush_poll_interval_ms: u64,
+    pub flush_timeout_ms: u64,
+    pub server_max_concurrent_connections: usize,
+    pub server_max_in_flight_requests_per_connection: usize,
+    pub server_max_request_bytes: usize,
+    pub server_max_statements_per_request: usize,
+    pub server_statement_timeout_ms: Option<u64>,
+    pub server_max_memory_intensive_requests: usize,
+    pub server_max_scan_rows: usize,
+    pub server_max_sort_rows: usize,
+    pub server_max_join_rows: usize,
+    pub server_max_query_result_rows: usize,
+    pub server_max_query_result_bytes: usize,
+    pub server_max_concurrent_queries_per_identity: Option<usize>,
+    pub security_auth_mode: AuthModeConfig,
+    pub security_tls_mode: TlsModeConfig,
+    pub security_user_count: usize,
+    pub security_token_count: usize,
+    pub security_tls_cert_path: Option<String>,
+    pub security_tls_key_path: Option<String>,
+    pub wal_segment_size_bytes: u64,
+    pub wal_sync_mode: SyncModeConfig,
+    pub sstable_data_block_size_bytes: usize,
+    pub sstable_restart_interval: usize,
+    pub sstable_bloom_bits_per_key: usize,
+    pub sstable_bloom_hash_functions: u8,
+    pub compaction: CompactionDiagnostics,
+}
+
+impl StartupDiagnostics {
+    pub fn as_key_value_lines(&self) -> Vec<String> {
+        let mut lines = vec![
+            format!("storage.memtable_size_bytes={}", self.memtable_size_bytes),
+            format!(
+                "storage.memtable_arena_block_size_bytes={}",
+                self.memtable_arena_block_size_bytes
+            ),
+            format!("storage.flush_poll_interval_ms={}", self.flush_poll_interval_ms),
+            format!("storage.flush_timeout_ms={}", self.flush_timeout_ms),
+            format!("server.max_concurrent_connections={}", self.server_max_concurrent_connections),
+            format!(
+                "server.max_in_flight_requests_per_connection={}",
+                self.server_max_in_flight_requests_per_connection
+            ),
+            format!("server.max_request_bytes={}", self.server_max_request_bytes),
+            format!("server.max_statements_per_request={}", self.server_max_statements_per_request),
+            format!(
+                "server.statement_timeout_ms={}",
+                format_optional_u64(self.server_statement_timeout_ms)
+            ),
+            format!(
+                "server.max_memory_intensive_requests={}",
+                self.server_max_memory_intensive_requests
+            ),
+            format!("server.max_scan_rows={}", self.server_max_scan_rows),
+            format!("server.max_sort_rows={}", self.server_max_sort_rows),
+            format!("server.max_join_rows={}", self.server_max_join_rows),
+            format!("server.max_query_result_rows={}", self.server_max_query_result_rows),
+            format!("server.max_query_result_bytes={}", self.server_max_query_result_bytes),
+            format!(
+                "server.max_concurrent_queries_per_identity={}",
+                format_optional_usize(self.server_max_concurrent_queries_per_identity)
+            ),
+            format!("security.auth.mode={}", self.security_auth_mode.as_str()),
+            format!("security.tls.mode={}", self.security_tls_mode.as_str()),
+            format!("security.auth.users={}", self.security_user_count),
+            format!("security.auth.tokens={}", self.security_token_count),
+            format!(
+                "security.tls.cert_path={}",
+                format_optional_string(self.security_tls_cert_path.as_deref())
+            ),
+            format!(
+                "security.tls.key_path={}",
+                format_optional_string(self.security_tls_key_path.as_deref())
+            ),
+            format!("wal.segment_size_bytes={}", self.wal_segment_size_bytes),
+            format!("wal.sync_mode={}", self.wal_sync_mode.as_str()),
+            format!("sstable.data_block_size_bytes={}", self.sstable_data_block_size_bytes),
+            format!("sstable.restart_interval={}", self.sstable_restart_interval),
+            format!("sstable.bloom_bits_per_key={}", self.sstable_bloom_bits_per_key),
+            format!("sstable.bloom_hash_functions={}", self.sstable_bloom_hash_functions),
+        ];
+
+        match self.compaction {
+            CompactionDiagnostics::Leveled {
+                level0_file_limit,
+                level_size_base_bytes,
+                level_size_multiplier,
+                max_levels,
+            } => {
+                lines.push("compaction.strategy=leveled".to_string());
+                lines.push(format!("compaction.leveled.level0_file_limit={level0_file_limit}"));
+                lines.push(format!(
+                    "compaction.leveled.level_size_base_bytes={level_size_base_bytes}"
+                ));
+                lines.push(format!(
+                    "compaction.leveled.level_size_multiplier={level_size_multiplier}"
+                ));
+                lines.push(format!("compaction.leveled.max_levels={max_levels}"));
+            }
+            CompactionDiagnostics::Tiered {
+                max_components_per_tier,
+                min_tier_size_bytes,
+                output_level,
+            } => {
+                lines.push("compaction.strategy=tiered".to_string());
+                lines.push(format!(
+                    "compaction.tiered.max_components_per_tier={max_components_per_tier}"
+                ));
+                lines.push(format!("compaction.tiered.min_tier_size_bytes={min_tier_size_bytes}"));
+                lines.push(format!("compaction.tiered.output_level={output_level}"));
+            }
+        }
+
+        lines
+    }
 }
 
 impl LsmdbConfig {
@@ -229,11 +494,143 @@ impl LsmdbConfig {
         if self.storage.memtable_arena_block_size_bytes == 0 {
             return Err(invalid("storage.memtable_arena_block_size_bytes", "must be > 0"));
         }
+        if self.storage.memtable_arena_block_size_bytes > self.storage.memtable_size_bytes {
+            return Err(invalid(
+                "storage.memtable_arena_block_size_bytes",
+                "must be <= storage.memtable_size_bytes",
+            ));
+        }
         if self.storage.flush_poll_interval_ms == 0 {
             return Err(invalid("storage.flush_poll_interval_ms", "must be > 0"));
         }
         if self.storage.flush_timeout_ms == 0 {
             return Err(invalid("storage.flush_timeout_ms", "must be > 0"));
+        }
+        if self.storage.flush_timeout_ms < self.storage.flush_poll_interval_ms {
+            return Err(invalid(
+                "storage.flush_timeout_ms",
+                "must be >= storage.flush_poll_interval_ms",
+            ));
+        }
+        if self.server.max_concurrent_connections == 0 {
+            return Err(invalid("server.max_concurrent_connections", "must be > 0"));
+        }
+        if self.server.max_in_flight_requests_per_connection == 0 {
+            return Err(invalid("server.max_in_flight_requests_per_connection", "must be > 0"));
+        }
+        if self.server.max_request_bytes == 0 {
+            return Err(invalid("server.max_request_bytes", "must be > 0"));
+        }
+        if self.server.max_statements_per_request == 0 {
+            return Err(invalid("server.max_statements_per_request", "must be > 0"));
+        }
+        if matches!(self.server.statement_timeout_ms, Some(0)) {
+            return Err(invalid("server.statement_timeout_ms", "must be > 0 when set"));
+        }
+        if self.server.max_memory_intensive_requests == 0 {
+            return Err(invalid("server.max_memory_intensive_requests", "must be > 0"));
+        }
+        if self.server.max_scan_rows == 0 {
+            return Err(invalid("server.max_scan_rows", "must be > 0"));
+        }
+        if self.server.max_sort_rows == 0 {
+            return Err(invalid("server.max_sort_rows", "must be > 0"));
+        }
+        if self.server.max_join_rows == 0 {
+            return Err(invalid("server.max_join_rows", "must be > 0"));
+        }
+        if self.server.max_query_result_rows == 0 {
+            return Err(invalid("server.max_query_result_rows", "must be > 0"));
+        }
+        if self.server.max_query_result_bytes == 0 {
+            return Err(invalid("server.max_query_result_bytes", "must be > 0"));
+        }
+        if matches!(self.server.max_concurrent_queries_per_identity, Some(0)) {
+            return Err(invalid(
+                "server.max_concurrent_queries_per_identity",
+                "must be > 0 when set",
+            ));
+        }
+        match self.security.auth.mode {
+            AuthModeConfig::Disabled => {}
+            AuthModeConfig::Password => {
+                if self.security.auth.users.is_empty() {
+                    return Err(invalid(
+                        "security.auth.users",
+                        "must contain at least one user when auth mode is 'password'",
+                    ));
+                }
+                let mut seen = std::collections::BTreeSet::new();
+                for user in &self.security.auth.users {
+                    if user.username.trim().is_empty() {
+                        return Err(invalid("security.auth.users.username", "must not be empty"));
+                    }
+                    if user.password.is_empty() {
+                        return Err(invalid("security.auth.users.password", "must not be empty"));
+                    }
+                    if !seen.insert(user.username.as_str()) {
+                        return Err(invalid(
+                            "security.auth.users.username",
+                            format!("duplicate username '{}'", user.username),
+                        ));
+                    }
+                }
+            }
+            AuthModeConfig::Token => {
+                if self.security.auth.tokens.is_empty() {
+                    return Err(invalid(
+                        "security.auth.tokens",
+                        "must contain at least one token when auth mode is 'token'",
+                    ));
+                }
+                let mut labels = std::collections::BTreeSet::new();
+                let mut tokens = std::collections::BTreeSet::new();
+                for token in &self.security.auth.tokens {
+                    if token.label.trim().is_empty() {
+                        return Err(invalid("security.auth.tokens.label", "must not be empty"));
+                    }
+                    if token.token.is_empty() {
+                        return Err(invalid("security.auth.tokens.token", "must not be empty"));
+                    }
+                    if !labels.insert(token.label.as_str()) {
+                        return Err(invalid(
+                            "security.auth.tokens.label",
+                            format!("duplicate token label '{}'", token.label),
+                        ));
+                    }
+                    if !tokens.insert(token.token.as_str()) {
+                        return Err(invalid(
+                            "security.auth.tokens.token",
+                            format!("duplicate token value for '{}'", token.label),
+                        ));
+                    }
+                }
+            }
+        }
+        if self.security.auth.mode != AuthModeConfig::Disabled
+            && self.security.tls.mode != TlsModeConfig::Required
+        {
+            return Err(invalid(
+                "security.tls.mode",
+                "must be 'required' when authentication is enabled",
+            ));
+        }
+        match self.security.tls.mode {
+            TlsModeConfig::Disabled => {}
+            TlsModeConfig::Required => {
+                let cert_path = self.security.tls.cert_path.as_ref().ok_or_else(|| {
+                    invalid("security.tls.cert_path", "must be set when tls mode is 'required'")
+                })?;
+                let key_path = self.security.tls.key_path.as_ref().ok_or_else(|| {
+                    invalid("security.tls.key_path", "must be set when tls mode is 'required'")
+                })?;
+                if cert_path.as_os_str().is_empty() {
+                    return Err(invalid("security.tls.cert_path", "must not be empty"));
+                }
+                if key_path.as_os_str().is_empty() {
+                    return Err(invalid("security.tls.key_path", "must not be empty"));
+                }
+            }
         }
         if self.wal.segment_size_bytes < MIN_WAL_SEGMENT_SIZE_BYTES {
             return Err(invalid(
@@ -272,12 +669,80 @@ impl LsmdbConfig {
         Ok(())
     }
 
+    pub fn startup_diagnostics(&self) -> Result<StartupDiagnostics, ConfigError> {
+        let runtime = self.to_runtime_config()?;
+        let storage = runtime.storage_engine;
+        let compaction = match runtime.compaction_strategy {
+            CompactionStrategy::Leveled(config) => CompactionDiagnostics::Leveled {
+                level0_file_limit: config.level0_file_limit,
+                level_size_base_bytes: config.level_size_base_bytes,
+                level_size_multiplier: config.level_size_multiplier,
+                max_levels: config.max_levels,
+            },
+            CompactionStrategy::Tiered(config) => CompactionDiagnostics::Tiered {
+                max_components_per_tier: config.max_components_per_tier,
+                min_tier_size_bytes: config.min_tier_size_bytes,
+                output_level: config.output_level,
+            },
+        };
+
+        Ok(StartupDiagnostics {
+            memtable_size_bytes: storage.memtable_size_bytes,
+            memtable_arena_block_size_bytes: storage.memtable_arena_block_size_bytes,
+            flush_poll_interval_ms: storage.flush_poll_interval.as_millis() as u64,
+            flush_timeout_ms: storage.flush_timeout.as_millis() as u64,
+            server_max_concurrent_connections: runtime.server_limits.max_concurrent_connections,
+            server_max_in_flight_requests_per_connection: runtime
+                .server_limits
+                .max_in_flight_requests_per_connection,
+            server_max_request_bytes: runtime.server_limits.max_request_bytes,
+            server_max_statements_per_request: runtime.server_limits.max_statements_per_request,
+            server_statement_timeout_ms: runtime.server_limits.statement_timeout_ms,
+            server_max_memory_intensive_requests: runtime
+                .server_limits
+                .max_memory_intensive_requests,
+            server_max_scan_rows: runtime.server_limits.max_scan_rows,
+            server_max_sort_rows: runtime.server_limits.max_sort_rows,
+            server_max_join_rows: runtime.server_limits.max_join_rows,
+            server_max_query_result_rows: runtime.server_limits.max_query_result_rows,
+            server_max_query_result_bytes: runtime.server_limits.max_query_result_bytes,
+            server_max_concurrent_queries_per_identity: runtime
+                .server_limits
+                .max_concurrent_queries_per_identity,
+            security_auth_mode: self.security.auth.mode,
+            security_tls_mode: self.security.tls.mode,
+            security_user_count: self.security.auth.users.len(),
+            security_token_count: self.security.auth.tokens.len(),
+            security_tls_cert_path: self
+                .security
+                .tls
+                .cert_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            security_tls_key_path: self
+                .security
+                .tls
+                .key_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            wal_segment_size_bytes: storage.wal_options.segment_size_bytes,
+            wal_sync_mode: SyncModeConfig::from(storage.wal_options.sync_mode),
+            sstable_data_block_size_bytes: storage.sstable_builder_options.data_block_size_bytes,
+            sstable_restart_interval: storage.sstable_builder_options.restart_interval,
+            sstable_bloom_bits_per_key: storage.sstable_builder_options.bloom_bits_per_key,
+            sstable_bloom_hash_functions: storage.sstable_builder_options.bloom_hash_functions,
+            compaction,
+        })
+    }
+
     pub fn to_runtime_config(&self) -> Result<RuntimeConfig, ConfigError> {
         self.validate()?;
 
         Ok(RuntimeConfig {
             storage_engine: self.to_storage_engine_options_unchecked(),
             compaction_strategy: self.to_compaction_strategy_unchecked(),
+            server_limits: self.to_server_limits_unchecked(),
+            server_security: self.to_server_security_options_unchecked(),
         })
     }
 
@@ -289,6 +754,24 @@ impl LsmdbConfig {
     pub fn to_compaction_strategy(&self) -> Result<CompactionStrategy, ConfigError> {
         self.validate()?;
         Ok(self.to_compaction_strategy_unchecked())
+    }
+
+    pub fn to_server_limits(&self) -> Result<ServerLimits, ConfigError> {
+        self.validate()?;
+        Ok(self.to_server_limits_unchecked())
+    }
+
+    pub fn to_server_security_options(&self) -> Result<ServerSecurityOptions, ConfigError> {
+        self.validate()?;
+        Ok(self.to_server_security_options_unchecked())
+    }
+
+    pub fn to_server_options(&self) -> Result<ServerOptions, ConfigError> {
+        self.validate()?;
+        Ok(ServerOptions {
+            limits: self.to_server_limits_unchecked(),
+            security: self.to_server_security_options_unchecked(),
+        })
     }
 
     fn to_storage_engine_options_unchecked(&self) -> StorageEngineOptions {
@@ -328,10 +811,83 @@ impl LsmdbConfig {
             }),
         }
     }
+
+    fn to_server_limits_unchecked(&self) -> ServerLimits {
+        ServerLimits {
+            max_concurrent_connections: self.server.max_concurrent_connections,
+            max_in_flight_requests_per_connection: self
+                .server
+                .max_in_flight_requests_per_connection,
+            max_request_bytes: self.server.max_request_bytes,
+            max_statements_per_request: self.server.max_statements_per_request,
+            statement_timeout_ms: self.server.statement_timeout_ms,
+            max_memory_intensive_requests: self.server.max_memory_intensive_requests,
+            max_scan_rows: self.server.max_scan_rows,
+            max_sort_rows: self.server.max_sort_rows,
+            max_join_rows: self.server.max_join_rows,
+            max_query_result_rows: self.server.max_query_result_rows,
+            max_query_result_bytes: self.server.max_query_result_bytes,
+            max_concurrent_queries_per_identity: self.server.max_concurrent_queries_per_identity,
+        }
+    }
+
+    fn to_server_security_options_unchecked(&self) -> ServerSecurityOptions {
+        let auth = match self.security.auth.mode {
+            AuthModeConfig::Disabled => ServerAuthOptions::Disabled,
+            AuthModeConfig::Password => ServerAuthOptions::StaticPassword {
+                users: self
+                    .security
+                    .auth
+                    .users
+                    .iter()
+                    .map(|user| StaticPasswordUser {
+                        username: user.username.clone(),
+                        password: user.password.clone(),
+                        role: user.role.into(),
+                    })
+                    .collect(),
+            },
+            AuthModeConfig::Token => ServerAuthOptions::StaticToken {
+                principals: self
+                    .security
+                    .auth
+                    .tokens
+                    .iter()
+                    .map(|token| StaticTokenPrincipal {
+                        label: token.label.clone(),
+                        token: token.token.clone(),
+                        role: token.role.into(),
+                    })
+                    .collect(),
+            },
+        };
+        let tls = ServerTlsOptions {
+            mode: match self.security.tls.mode {
+                TlsModeConfig::Disabled => ServerTlsMode::Disabled,
+                TlsModeConfig::Required => ServerTlsMode::Required,
+            },
+            cert_path: self.security.tls.cert_path.clone(),
+            key_path: self.security.tls.key_path.clone(),
+        };
+
+        ServerSecurityOptions { auth, tls, allow_anonymous_access: false }
+    }
 }
 
 fn invalid(field: &'static str, message: impl Into<String>) -> ConfigError {
     ConfigError::InvalidValue { field, message: message.into() }
+}
+
+fn format_optional_u64(value: Option<u64>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_else(|| "none".to_string())
+}
+
+fn format_optional_usize(value: Option<usize>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_else(|| "none".to_string())
+}
+
+fn format_optional_string(value: Option<&str>) -> String {
+    value.map(str::to_string).unwrap_or_else(|| "none".to_string())
 }
 
 fn bloom_params_for_fpr(fpr: f64) -> (usize, u8) {
@@ -354,6 +910,11 @@ mod tests {
 
     use super::*;
 
+    const TLS_CERT_PATH: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tls/server.crt");
+    const TLS_KEY_PATH: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tls/server.key");
+
     fn temp_file_path(label: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
         let nanos = SystemTime::now()
@@ -371,6 +932,7 @@ mod tests {
 
         let runtime = config.to_runtime_config().expect("runtime config");
         assert!(runtime.storage_engine.memtable_size_bytes > 0);
+        assert!(runtime.server_limits.max_concurrent_connections > 0);
         match runtime.compaction_strategy {
             CompactionStrategy::Leveled(_) => {}
             CompactionStrategy::Tiered(_) => panic!("expected leveled strategy by default"),
@@ -385,6 +947,17 @@ mod tests {
             memtable_arena_block_size_bytes = 16384
             flush_poll_interval_ms = 15
             flush_timeout_ms = 2000
+
+            [server]
+            max_concurrent_connections = 32
+            max_in_flight_requests_per_connection = 1
+            max_request_bytes = 65536
+            max_statements_per_request = 8
+            max_memory_intensive_requests = 4
+            max_scan_rows = 2048
+            max_sort_rows = 1024
+            max_join_rows = 512
+            max_query_result_rows = 256
 
             [wal]
             segment_size_bytes = 16777216
@@ -406,7 +979,11 @@ mod tests {
 
         let config = LsmdbConfig::from_toml_str(raw).expect("parse custom config");
         let options = config.to_storage_engine_options().expect("storage options");
+        let server_limits = config.to_server_limits().expect("server limits");
         assert_eq!(options.memtable_size_bytes, 1_048_576);
+        assert_eq!(server_limits.max_concurrent_connections, 32);
+        assert_eq!(server_limits.max_request_bytes, 65_536);
+        assert_eq!(server_limits.max_join_rows, 512);
         assert_eq!(options.wal_options.segment_size_bytes, 16_777_216);
         assert_eq!(options.wal_options.sync_mode, SyncMode::Always);
         assert_eq!(options.sstable_builder_options.data_block_size_bytes, 8192);
@@ -423,6 +1000,40 @@ mod tests {
             }
             CompactionStrategy::Leveled(_) => panic!("expected tiered strategy"),
         }
+    }
+
+    #[test]
+    fn parses_and_maps_security_config() {
+        let raw = format!(
+            r#"
+                [security.auth]
+                mode = "password"
+
+                [[security.auth.users]]
+                username = "admin"
+                password = "secret"
+                role = "admin"
+
+                [security.tls]
+                mode = "required"
+                cert_path = "{TLS_CERT_PATH}"
+                key_path = "{TLS_KEY_PATH}"
+            "#
+        );
+
+        let config = LsmdbConfig::from_toml_str(&raw).expect("parse security config");
+        let options = config.to_server_options().expect("server options");
+        match options.security.auth {
+            ServerAuthOptions::StaticPassword { users } => {
+                assert_eq!(users.len(), 1);
+                assert_eq!(users[0].username, "admin");
+                assert_eq!(users[0].role, ServerRole::Admin);
+            }
+            other => panic!("expected static password auth, got {other:?}"),
+        }
+        assert_eq!(options.security.tls.mode, ServerTlsMode::Required);
+        assert_eq!(options.security.tls.cert_path.as_deref(), Some(Path::new(TLS_CERT_PATH)));
+        assert_eq!(options.security.tls.key_path.as_deref(), Some(Path::new(TLS_KEY_PATH)));
     }
 
     #[test]
@@ -454,5 +1065,160 @@ mod tests {
         assert_eq!(config.storage.memtable_size_bytes, 8192);
 
         fs::remove_file(path).expect("cleanup temp config");
+    }
+
+    #[test]
+    fn rejects_arena_block_larger_than_memtable() {
+        let raw = r#"
+            [storage]
+            memtable_size_bytes = 4096
+            memtable_arena_block_size_bytes = 8192
+        "#;
+
+        let err = LsmdbConfig::from_toml_str(raw).expect_err("invalid arena block size");
+        assert!(matches!(
+            err,
+            ConfigError::InvalidValue { field, .. }
+            if field == "storage.memtable_arena_block_size_bytes"
+        ));
+    }
+
+    #[test]
+    fn rejects_flush_timeout_smaller_than_poll_interval() {
+        let raw = r#"
+            [storage]
+            flush_poll_interval_ms = 100
+            flush_timeout_ms = 50
+        "#;
+
+        let err = LsmdbConfig::from_toml_str(raw).expect_err("invalid flush timing");
+        assert!(
+            matches!(err, ConfigError::InvalidValue { field, .. } if field == "storage.flush_timeout_ms")
+        );
+    }
+
+    #[test]
+    fn rejects_zero_server_connection_limit() {
+        let raw = r#"
+            [server]
+            max_concurrent_connections = 0
+        "#;
+
+        let err = LsmdbConfig::from_toml_str(raw).expect_err("invalid server limit");
+        assert!(
+            matches!(err, ConfigError::InvalidValue { field, .. } if field == "server.max_concurrent_connections")
+        );
+    }
+
+    #[test]
+    fn rejects_password_auth_without_users() {
+        let raw = r#"
+            [security.auth]
+            mode = "password"
+        "#;
+
+        let err = LsmdbConfig::from_toml_str(raw).expect_err("missing users should fail");
+        assert!(
+            matches!(err, ConfigError::InvalidValue { field, .. } if field == "security.auth.users")
+        );
+    }
+
+    #[test]
+    fn rejects_password_auth_without_required_tls() {
+        let raw = r#"
+            [security.auth]
+            mode = "password"
+
+            [[security.auth.users]]
+            username = "admin"
+            password = "secret"
+            role = "admin"
+        "#;
+
+        let err = LsmdbConfig::from_toml_str(raw).expect_err("password auth should require tls");
+        assert!(
+            matches!(err, ConfigError::InvalidValue { field, .. } if field == "security.tls.mode")
+        );
+    }
+
+    #[test]
+    fn rejects_tls_required_without_key_path() {
+        let raw = r#"
+            [security.tls]
+            mode = "required"
+            cert_path = "./server.crt"
+        "#;
+
+        let err = LsmdbConfig::from_toml_str(raw).expect_err("missing key should fail");
+        assert!(
+            matches!(err, ConfigError::InvalidValue { field, .. } if field == "security.tls.key_path")
+        );
+    }
+
+    #[test]
+    fn emits_startup_diagnostics_for_runtime_config() {
+        let raw = format!(
+            r#"
+            [storage]
+            memtable_size_bytes = 8192
+            memtable_arena_block_size_bytes = 4096
+            flush_poll_interval_ms = 25
+            flush_timeout_ms = 100
+
+            [server]
+            max_concurrent_connections = 24
+            max_in_flight_requests_per_connection = 1
+            max_request_bytes = 32768
+            max_statements_per_request = 4
+            max_memory_intensive_requests = 2
+            max_scan_rows = 128
+            max_sort_rows = 64
+            max_join_rows = 32
+            max_query_result_rows = 16
+
+            [wal]
+            segment_size_bytes = 4096
+            sync_mode = "on_commit"
+
+            [security.auth]
+            mode = "token"
+
+            [[security.auth.tokens]]
+            label = "ops-bot"
+            token = "opaque"
+            role = "writer"
+
+            [security.tls]
+            mode = "required"
+            cert_path = "{TLS_CERT_PATH}"
+            key_path = "{TLS_KEY_PATH}"
+
+            [compaction]
+            strategy = "leveled"
+        "#
+        );
+
+        let config = LsmdbConfig::from_toml_str(&raw).expect("parse valid config");
+        let diagnostics = config.startup_diagnostics().expect("startup diagnostics");
+        assert_eq!(diagnostics.memtable_size_bytes, 8192);
+        assert_eq!(diagnostics.memtable_arena_block_size_bytes, 4096);
+        assert_eq!(diagnostics.flush_poll_interval_ms, 25);
+        assert_eq!(diagnostics.flush_timeout_ms, 100);
+        assert_eq!(diagnostics.server_max_concurrent_connections, 24);
+        assert_eq!(diagnostics.server_max_request_bytes, 32_768);
+        assert_eq!(diagnostics.server_max_query_result_rows, 16);
+        assert_eq!(diagnostics.security_auth_mode, AuthModeConfig::Token);
+        assert_eq!(diagnostics.security_tls_mode, TlsModeConfig::Required);
+        assert_eq!(diagnostics.security_user_count, 0);
+        assert_eq!(diagnostics.security_token_count, 1);
+        assert_eq!(diagnostics.wal_segment_size_bytes, 4096);
+        assert_eq!(diagnostics.wal_sync_mode, SyncModeConfig::OnCommit);
+
+        let lines = diagnostics.as_key_value_lines();
+        assert!(lines.iter().any(|line| line == "server.max_concurrent_connections=24"));
+        assert!(lines.iter().any(|line| line == "security.auth.mode=token"));
+        assert!(lines.iter().any(|line| line == "security.tls.mode=required"));
+        assert!(lines.iter().any(|line| line == "compaction.strategy=leveled"));
+        assert!(lines.iter().any(|line| line.starts_with("sstable.bloom_bits_per_key=")));
     }
 }

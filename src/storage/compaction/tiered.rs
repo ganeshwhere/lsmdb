@@ -39,13 +39,13 @@ pub fn pick_compaction(
     version_set: &VersionSet,
     config: &TieredCompactionConfig,
 ) -> Option<TieredCompactionPlan> {
-    let mut tiers = group_tables_into_tiers(version_set, config);
+    let tiers = group_tables_into_tiers(version_set, config);
     if tiers.is_empty() {
         return None;
     }
 
     let mut best: Option<TieredCompactionPlan> = None;
-    for (tier_id, mut tables) in tiers.drain() {
+    for (tier_id, mut tables) in tiers.into_iter() {
         if tables.len() < config.max_components_per_tier {
             continue;
         }

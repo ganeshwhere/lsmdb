@@ -90,3 +90,11 @@ Supported expression forms:
 - secondary indexes
 - prepared statements
 - SQL-backed persistence through `StorageEngine` (executor currently uses in-memory MVCC store)
+
+## Conformance coverage
+
+- Fixture-driven SQL conformance tests live under `tests/conformance/sql/`.
+- Run with: `cargo test --test sql_conformance`.
+- Machine-readable compatibility report artifact is emitted to:
+  - `target/sql-conformance/report.toml`
+- Additional suite details and fixture schema are documented in `docs/sql_conformance.md`.

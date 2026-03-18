@@ -5,6 +5,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::executor::{ExecutionResult, QueryResult, ScalarValue};
 
+pub const PROTOCOL_VERSION: u16 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RequestType {
@@ -13,6 +15,12 @@ pub enum RequestType {
     Commit = 3,
     Rollback = 4,
     Explain = 5,
+    Health = 6,
+    Readiness = 7,
+    AdminStatus = 8,
+    ActiveStatements = 9,
+    CancelStatement = 10,
+    Authenticate = 11,
 }
 
 impl TryFrom<u8> for RequestType {
@@ -25,6 +33,12 @@ impl TryFrom<u8> for RequestType {
             3 => Ok(RequestType::Commit),
             4 => Ok(RequestType::Rollback),
             5 => Ok(RequestType::Explain),
+            6 => Ok(RequestType::Health),
+            7 => Ok(RequestType::Readiness),
+            8 => Ok(RequestType::AdminStatus),
+            9 => Ok(RequestType::ActiveStatements),
+            10 => Ok(RequestType::CancelStatement),
+            11 => Ok(RequestType::Authenticate),
             other => {
                 Err(ProtocolError::InvalidFrame(format!("unknown request type byte: {other}")))
             }
@@ -38,10 +52,87 @@ pub struct RequestFrame {
     pub sql: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthenticationRequest {
+    Password { username: String, password: String },
+    Token { token: String },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResponseFrame {
     Ok(ResponsePayload),
-    Err(String),
+    Err(ErrorPayload),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ErrorCode {
+    InvalidRequest = 1,
+    Parse = 2,
+    Validation = 3,
+    Planner = 4,
+    Execution = 5,
+    Busy = 6,
+    ResourceLimit = 7,
+    Timeout = 8,
+    Canceled = 9,
+    Quota = 10,
+    Unauthenticated = 11,
+    PermissionDenied = 12,
+}
+
+impl TryFrom<u8> for ErrorCode {
+    type Error = ProtocolError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(ErrorCode::InvalidRequest),
+            2 => Ok(ErrorCode::Parse),
+            3 => Ok(ErrorCode::Validation),
+            4 => Ok(ErrorCode::Planner),
+            5 => Ok(ErrorCode::Execution),
+            6 => Ok(ErrorCode::Busy),
+            7 => Ok(ErrorCode::ResourceLimit),
+            8 => Ok(ErrorCode::Timeout),
+            9 => Ok(ErrorCode::Canceled),
+            10 => Ok(ErrorCode::Quota),
+            11 => Ok(ErrorCode::Unauthenticated),
+            12 => Ok(ErrorCode::PermissionDenied),
+            other => Err(ProtocolError::InvalidFrame(format!("unknown error code byte: {other}"))),
+        }
+    }
+}
+
+impl ErrorCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ErrorCode::InvalidRequest => "INVALID_REQUEST",
+            ErrorCode::Parse => "PARSE",
+            ErrorCode::Validation => "VALIDATION",
+            ErrorCode::Planner => "PLANNER",
+            ErrorCode::Execution => "EXECUTION",
+            ErrorCode::Busy => "BUSY",
+            ErrorCode::ResourceLimit => "RESOURCE_LIMIT",
+            ErrorCode::Timeout => "TIMEOUT",
+            ErrorCode::Canceled => "CANCELED",
+            ErrorCode::Quota => "QUOTA",
+            ErrorCode::Unauthenticated => "UNAUTHENTICATED",
+            ErrorCode::PermissionDenied => "PERMISSION_DENIED",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorPayload {
+    pub code: ErrorCode,
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl ErrorPayload {
+    pub fn new(code: ErrorCode, message: impl Into<String>, retryable: bool) -> Self {
+        Self { code, message: message.into(), retryable }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -50,12 +141,83 @@ pub enum ResponsePayload {
     AffectedRows(u64),
     TransactionState(TransactionState),
     ExplainPlan(String),
+    Health(HealthPayload),
+    Readiness(ReadinessPayload),
+    AdminStatus(AdminStatusPayload),
+    ActiveStatements(ActiveStatementsPayload),
+    StatementCancellation(StatementCancellationPayload),
+    Authentication(AuthenticationPayload),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryPayload {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Vec<u8>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthPayload {
+    pub ok: bool,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadinessPayload {
+    pub ready: bool,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminStatusPayload {
+    pub server_version: String,
+    pub protocol_version: u16,
+    pub uptime_seconds: u64,
+    pub accepting_connections: bool,
+    pub active_connections: u64,
+    pub total_connections: u64,
+    pub rejected_connections: u64,
+    pub busy_requests: u64,
+    pub resource_limit_requests: u64,
+    pub quota_rejections: u64,
+    pub timed_out_requests: u64,
+    pub canceled_requests: u64,
+    pub active_statements: u64,
+    pub active_memory_intensive_requests: u64,
+    pub mvcc_started: u64,
+    pub mvcc_committed: u64,
+    pub mvcc_rolled_back: u64,
+    pub mvcc_write_conflicts: u64,
+    pub mvcc_active_transactions: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveStatementsPayload {
+    pub statements: Vec<ActiveStatementPayload>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveStatementPayload {
+    pub statement_id: u64,
+    pub connection_id: u64,
+    pub identity: String,
+    pub request_type: String,
+    pub runtime_ms: u64,
+    pub cancel_requested: bool,
+    pub sql_preview: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatementCancellationPayload {
+    pub statement_id: u64,
+    pub accepted: bool,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticationPayload {
+    pub identity: String,
+    pub role: String,
+    pub auth_scheme: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,20 +234,32 @@ pub enum ProtocolError {
     Io(#[from] std::io::Error),
     #[error("invalid frame: {0}")]
     InvalidFrame(String),
+    #[error("frame too large: length={length}, max={max}")]
+    FrameTooLarge { length: usize, max: usize },
     #[error("utf8 decode error: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
 }
 
-pub async fn read_request<R: AsyncRead + Unpin>(
+pub async fn read_request<R: AsyncRead + Unpin + ?Sized>(
     reader: &mut R,
 ) -> Result<Option<RequestFrame>, ProtocolError> {
-    let Some(body) = read_frame(reader).await? else {
+    let Some(body) = read_frame(reader, None).await? else {
         return Ok(None);
     };
     decode_request(&body).map(Some)
 }
 
-pub async fn write_request<W: AsyncWrite + Unpin>(
+pub async fn read_request_with_limit<R: AsyncRead + Unpin + ?Sized>(
+    reader: &mut R,
+    max_body_bytes: usize,
+) -> Result<Option<RequestFrame>, ProtocolError> {
+    let Some(body) = read_frame(reader, Some(max_body_bytes)).await? else {
+        return Ok(None);
+    };
+    decode_request(&body).map(Some)
+}
+
+pub async fn write_request<W: AsyncWrite + Unpin + ?Sized>(
     writer: &mut W,
     request: &RequestFrame,
 ) -> Result<(), ProtocolError> {
@@ -93,21 +267,82 @@ pub async fn write_request<W: AsyncWrite + Unpin>(
     write_frame(writer, &body).await
 }
 
-pub async fn read_response<R: AsyncRead + Unpin>(
+pub async fn read_response<R: AsyncRead + Unpin + ?Sized>(
     reader: &mut R,
 ) -> Result<Option<ResponseFrame>, ProtocolError> {
-    let Some(body) = read_frame(reader).await? else {
+    let Some(body) = read_frame(reader, None).await? else {
         return Ok(None);
     };
     decode_response(&body).map(Some)
 }
 
-pub async fn write_response<W: AsyncWrite + Unpin>(
+pub async fn write_response<W: AsyncWrite + Unpin + ?Sized>(
     writer: &mut W,
     response: &ResponseFrame,
 ) -> Result<(), ProtocolError> {
     let body = encode_response(response)?;
     write_frame(writer, &body).await
+}
+
+pub fn authentication_request_with_password(
+    username: impl Into<String>,
+    password: impl Into<String>,
+) -> RequestFrame {
+    RequestFrame {
+        request_type: RequestType::Authenticate,
+        sql: encode_authentication_request(AuthenticationRequest::Password {
+            username: username.into(),
+            password: password.into(),
+        }),
+    }
+}
+
+pub fn authentication_request_with_token(token: impl Into<String>) -> RequestFrame {
+    RequestFrame {
+        request_type: RequestType::Authenticate,
+        sql: encode_authentication_request(AuthenticationRequest::Token { token: token.into() }),
+    }
+}
+
+pub fn decode_authentication_request(payload: &str) -> Result<AuthenticationRequest, String> {
+    let mut parts = payload.splitn(3, '\0');
+    let scheme = parts.next().unwrap_or_default();
+    let identity = parts.next().unwrap_or_default();
+    let secret = parts.next().unwrap_or_default();
+
+    match scheme {
+        "password" => {
+            if identity.is_empty() {
+                return Err("password authentication requires a username".to_string());
+            }
+            if secret.is_empty() {
+                return Err("password authentication requires a password".to_string());
+            }
+            Ok(AuthenticationRequest::Password {
+                username: identity.to_string(),
+                password: secret.to_string(),
+            })
+        }
+        "token" => {
+            if !identity.is_empty() {
+                return Err("token authentication does not accept a username".to_string());
+            }
+            if secret.is_empty() {
+                return Err("token authentication requires a token".to_string());
+            }
+            Ok(AuthenticationRequest::Token { token: secret.to_string() })
+        }
+        _ => Err("authentication payload must use the 'password' or 'token' scheme".to_string()),
+    }
+}
+
+fn encode_authentication_request(request: AuthenticationRequest) -> String {
+    match request {
+        AuthenticationRequest::Password { username, password } => {
+            format!("password\0{username}\0{password}")
+        }
+        AuthenticationRequest::Token { token } => format!("token\0\0{token}"),
+    }
 }
 
 pub fn payload_from_execution_result(result: &ExecutionResult) -> ResponsePayload {
@@ -171,8 +406,9 @@ fn hex_char(value: u8) -> char {
     }
 }
 
-async fn read_frame<R: AsyncRead + Unpin>(
+async fn read_frame<R: AsyncRead + Unpin + ?Sized>(
     reader: &mut R,
+    max_body_bytes: Option<usize>,
 ) -> Result<Option<Vec<u8>>, ProtocolError> {
     let mut len_buf = [0_u8; 4];
     match reader.read_exact(&mut len_buf).await {
@@ -187,13 +423,25 @@ async fn read_frame<R: AsyncRead + Unpin>(
             "frame length must be greater than zero".to_string(),
         ));
     }
+    if let Some(max_body_bytes) = max_body_bytes {
+        if length > max_body_bytes {
+            let mut remaining = length;
+            let mut discard_buf = [0_u8; 4096];
+            while remaining > 0 {
+                let chunk_len = remaining.min(discard_buf.len());
+                reader.read_exact(&mut discard_buf[..chunk_len]).await?;
+                remaining -= chunk_len;
+            }
+            return Err(ProtocolError::FrameTooLarge { length, max: max_body_bytes });
+        }
+    }
 
     let mut body = vec![0_u8; length];
     reader.read_exact(&mut body).await?;
     Ok(Some(body))
 }
 
-async fn write_frame<W: AsyncWrite + Unpin>(
+async fn write_frame<W: AsyncWrite + Unpin + ?Sized>(
     writer: &mut W,
     body: &[u8],
 ) -> Result<(), ProtocolError> {
@@ -229,9 +477,11 @@ fn encode_response(response: &ResponseFrame) -> Result<Vec<u8>, ProtocolError> {
             body.push(0_u8);
             encode_payload(payload, &mut body)?;
         }
-        ResponseFrame::Err(message) => {
+        ResponseFrame::Err(error) => {
             body.push(1_u8);
-            write_len_prefixed_bytes(&mut body, message.as_bytes())?;
+            body.push(error.code as u8);
+            body.push(u8::from(error.retryable));
+            write_len_prefixed_bytes(&mut body, error.message.as_bytes())?;
         }
     }
     Ok(body)
@@ -255,13 +505,15 @@ fn decode_response(body: &[u8]) -> Result<ResponseFrame, ProtocolError> {
         }
         1 => {
             let mut cursor = Cursor::new(payload);
+            let code = ErrorCode::try_from(read_u8(&mut cursor)?)?;
+            let retryable = read_bool(&mut cursor)?;
             let message = read_len_prefixed_string(&mut cursor)?;
             if (cursor.position() as usize) != payload.len() {
                 return Err(ProtocolError::InvalidFrame(
                     "error payload has trailing bytes".to_string(),
                 ));
             }
-            Ok(ResponseFrame::Err(message))
+            Ok(ResponseFrame::Err(ErrorPayload { code, message, retryable }))
         }
         other => Err(ProtocolError::InvalidFrame(format!("unknown response status byte: {other}"))),
     }
@@ -294,6 +546,63 @@ fn encode_payload(payload: &ResponsePayload, out: &mut Vec<u8>) -> Result<(), Pr
         ResponsePayload::ExplainPlan(plan) => {
             out.push(4_u8);
             write_len_prefixed_bytes(out, plan.as_bytes())?;
+        }
+        ResponsePayload::Health(health) => {
+            out.push(5_u8);
+            out.push(u8::from(health.ok));
+            write_len_prefixed_bytes(out, health.status.as_bytes())?;
+        }
+        ResponsePayload::Readiness(readiness) => {
+            out.push(6_u8);
+            out.push(u8::from(readiness.ready));
+            write_len_prefixed_bytes(out, readiness.status.as_bytes())?;
+        }
+        ResponsePayload::AdminStatus(status) => {
+            out.push(7_u8);
+            write_len_prefixed_bytes(out, status.server_version.as_bytes())?;
+            out.extend(status.protocol_version.to_be_bytes());
+            out.extend(status.uptime_seconds.to_be_bytes());
+            out.push(u8::from(status.accepting_connections));
+            out.extend(status.active_connections.to_be_bytes());
+            out.extend(status.total_connections.to_be_bytes());
+            out.extend(status.rejected_connections.to_be_bytes());
+            out.extend(status.busy_requests.to_be_bytes());
+            out.extend(status.resource_limit_requests.to_be_bytes());
+            out.extend(status.quota_rejections.to_be_bytes());
+            out.extend(status.timed_out_requests.to_be_bytes());
+            out.extend(status.canceled_requests.to_be_bytes());
+            out.extend(status.active_statements.to_be_bytes());
+            out.extend(status.active_memory_intensive_requests.to_be_bytes());
+            out.extend(status.mvcc_started.to_be_bytes());
+            out.extend(status.mvcc_committed.to_be_bytes());
+            out.extend(status.mvcc_rolled_back.to_be_bytes());
+            out.extend(status.mvcc_write_conflicts.to_be_bytes());
+            out.extend(status.mvcc_active_transactions.to_be_bytes());
+        }
+        ResponsePayload::ActiveStatements(payload) => {
+            out.push(8_u8);
+            write_u32(out, payload.statements.len())?;
+            for statement in &payload.statements {
+                out.extend(statement.statement_id.to_be_bytes());
+                out.extend(statement.connection_id.to_be_bytes());
+                write_len_prefixed_bytes(out, statement.identity.as_bytes())?;
+                write_len_prefixed_bytes(out, statement.request_type.as_bytes())?;
+                out.extend(statement.runtime_ms.to_be_bytes());
+                out.push(u8::from(statement.cancel_requested));
+                write_len_prefixed_bytes(out, statement.sql_preview.as_bytes())?;
+            }
+        }
+        ResponsePayload::StatementCancellation(payload) => {
+            out.push(9_u8);
+            out.extend(payload.statement_id.to_be_bytes());
+            out.push(u8::from(payload.accepted));
+            write_len_prefixed_bytes(out, payload.status.as_bytes())?;
+        }
+        ResponsePayload::Authentication(payload) => {
+            out.push(10_u8);
+            write_len_prefixed_bytes(out, payload.identity.as_bytes())?;
+            write_len_prefixed_bytes(out, payload.role.as_bytes())?;
+            write_len_prefixed_bytes(out, payload.auth_scheme.as_bytes())?;
         }
     }
     Ok(())
@@ -343,6 +652,101 @@ fn decode_payload(cursor: &mut Cursor<&[u8]>) -> Result<ResponsePayload, Protoco
             let plan = read_len_prefixed_string(cursor)?;
             Ok(ResponsePayload::ExplainPlan(plan))
         }
+        5 => {
+            let ok = read_bool(cursor)?;
+            let status = read_len_prefixed_string(cursor)?;
+            Ok(ResponsePayload::Health(HealthPayload { ok, status }))
+        }
+        6 => {
+            let ready = read_bool(cursor)?;
+            let status = read_len_prefixed_string(cursor)?;
+            Ok(ResponsePayload::Readiness(ReadinessPayload { ready, status }))
+        }
+        7 => {
+            let server_version = read_len_prefixed_string(cursor)?;
+            let protocol_version = read_u16(cursor)?;
+            let uptime_seconds = read_u64(cursor)?;
+            let accepting_connections = read_bool(cursor)?;
+            let active_connections = read_u64(cursor)?;
+            let total_connections = read_u64(cursor)?;
+            let rejected_connections = read_u64(cursor)?;
+            let busy_requests = read_u64(cursor)?;
+            let resource_limit_requests = read_u64(cursor)?;
+            let quota_rejections = read_u64(cursor)?;
+            let timed_out_requests = read_u64(cursor)?;
+            let canceled_requests = read_u64(cursor)?;
+            let active_statements = read_u64(cursor)?;
+            let active_memory_intensive_requests = read_u64(cursor)?;
+            let mvcc_started = read_u64(cursor)?;
+            let mvcc_committed = read_u64(cursor)?;
+            let mvcc_rolled_back = read_u64(cursor)?;
+            let mvcc_write_conflicts = read_u64(cursor)?;
+            let mvcc_active_transactions = read_u64(cursor)?;
+            Ok(ResponsePayload::AdminStatus(AdminStatusPayload {
+                server_version,
+                protocol_version,
+                uptime_seconds,
+                accepting_connections,
+                active_connections,
+                total_connections,
+                rejected_connections,
+                busy_requests,
+                resource_limit_requests,
+                quota_rejections,
+                timed_out_requests,
+                canceled_requests,
+                active_statements,
+                active_memory_intensive_requests,
+                mvcc_started,
+                mvcc_committed,
+                mvcc_rolled_back,
+                mvcc_write_conflicts,
+                mvcc_active_transactions,
+            }))
+        }
+        8 => {
+            let count = read_u32(cursor)? as usize;
+            let mut statements = Vec::with_capacity(count);
+            for _ in 0..count {
+                let statement_id = read_u64(cursor)?;
+                let connection_id = read_u64(cursor)?;
+                let identity = read_len_prefixed_string(cursor)?;
+                let request_type = read_len_prefixed_string(cursor)?;
+                let runtime_ms = read_u64(cursor)?;
+                let cancel_requested = read_bool(cursor)?;
+                let sql_preview = read_len_prefixed_string(cursor)?;
+                statements.push(ActiveStatementPayload {
+                    statement_id,
+                    connection_id,
+                    identity,
+                    request_type,
+                    runtime_ms,
+                    cancel_requested,
+                    sql_preview,
+                });
+            }
+            Ok(ResponsePayload::ActiveStatements(ActiveStatementsPayload { statements }))
+        }
+        9 => {
+            let statement_id = read_u64(cursor)?;
+            let accepted = read_bool(cursor)?;
+            let status = read_len_prefixed_string(cursor)?;
+            Ok(ResponsePayload::StatementCancellation(StatementCancellationPayload {
+                statement_id,
+                accepted,
+                status,
+            }))
+        }
+        10 => {
+            let identity = read_len_prefixed_string(cursor)?;
+            let role = read_len_prefixed_string(cursor)?;
+            let auth_scheme = read_len_prefixed_string(cursor)?;
+            Ok(ResponsePayload::Authentication(AuthenticationPayload {
+                identity,
+                role,
+                auth_scheme,
+            }))
+        }
         other => {
             Err(ProtocolError::InvalidFrame(format!("unknown response payload type: {other}")))
         }
@@ -381,6 +785,20 @@ fn read_u16(cursor: &mut Cursor<&[u8]>) -> Result<u16, ProtocolError> {
     Ok(u16::from_be_bytes(raw))
 }
 
+fn read_u64(cursor: &mut Cursor<&[u8]>) -> Result<u64, ProtocolError> {
+    let mut raw = [0_u8; 8];
+    read_exact(cursor, &mut raw)?;
+    Ok(u64::from_be_bytes(raw))
+}
+
+fn read_bool(cursor: &mut Cursor<&[u8]>) -> Result<bool, ProtocolError> {
+    match read_u8(cursor)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        other => Err(ProtocolError::InvalidFrame(format!("invalid bool byte: {other}"))),
+    }
+}
+
 fn read_u32(cursor: &mut Cursor<&[u8]>) -> Result<u32, ProtocolError> {
     let mut raw = [0_u8; 4];
     read_exact(cursor, &mut raw)?;
@@ -400,7 +818,7 @@ fn read_len_prefixed_bytes(cursor: &mut Cursor<&[u8]>) -> Result<Vec<u8>, Protoc
 }
 
 fn read_exact(cursor: &mut Cursor<&[u8]>, out: &mut [u8]) -> Result<(), ProtocolError> {
-    cursor.read_exact(out).map_err(|err| ProtocolError::InvalidFrame(err.to_string()))
+    Read::read_exact(cursor, out).map_err(|err| ProtocolError::InvalidFrame(err.to_string()))
 }
 
 #[cfg(test)]
@@ -428,6 +846,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn error_response_round_trip() {
+        let response = ResponseFrame::Err(ErrorPayload {
+            code: ErrorCode::Busy,
+            message: "server busy: retry later".to_string(),
+            retryable: true,
+        });
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        write_response(&mut client, &response).await.expect("write response");
+        let decoded = read_response(&mut server).await.expect("read response").expect("response");
+        assert_eq!(decoded, response);
+    }
+
+    #[tokio::test]
     async fn explain_payload_round_trip() {
         let response =
             ResponseFrame::Ok(ResponsePayload::ExplainPlan("PrimaryKeyScan(users)".to_string()));
@@ -435,5 +866,109 @@ mod tests {
         write_response(&mut client, &response).await.expect("write response");
         let decoded = read_response(&mut server).await.expect("read response").expect("response");
         assert_eq!(decoded, response);
+    }
+
+    #[tokio::test]
+    async fn health_payload_round_trip() {
+        let response = ResponseFrame::Ok(ResponsePayload::Health(HealthPayload {
+            ok: true,
+            status: "ok".to_string(),
+        }));
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        write_response(&mut client, &response).await.expect("write response");
+        let decoded = read_response(&mut server).await.expect("read response").expect("response");
+        assert_eq!(decoded, response);
+    }
+
+    #[tokio::test]
+    async fn admin_status_payload_round_trip() {
+        let response = ResponseFrame::Ok(ResponsePayload::AdminStatus(AdminStatusPayload {
+            server_version: "0.1.0".to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            uptime_seconds: 42,
+            accepting_connections: true,
+            active_connections: 1,
+            total_connections: 4,
+            rejected_connections: 2,
+            busy_requests: 3,
+            resource_limit_requests: 1,
+            quota_rejections: 4,
+            timed_out_requests: 5,
+            canceled_requests: 6,
+            active_statements: 7,
+            active_memory_intensive_requests: 0,
+            mvcc_started: 12,
+            mvcc_committed: 9,
+            mvcc_rolled_back: 2,
+            mvcc_write_conflicts: 1,
+            mvcc_active_transactions: 0,
+        }));
+        let (mut client, mut server) = tokio::io::duplex(2048);
+        write_response(&mut client, &response).await.expect("write response");
+        let decoded = read_response(&mut server).await.expect("read response").expect("response");
+        assert_eq!(decoded, response);
+    }
+
+    #[tokio::test]
+    async fn active_statements_payload_round_trip() {
+        let response =
+            ResponseFrame::Ok(ResponsePayload::ActiveStatements(ActiveStatementsPayload {
+                statements: vec![ActiveStatementPayload {
+                    statement_id: 11,
+                    connection_id: 3,
+                    identity: "127.0.0.1".to_string(),
+                    request_type: "QUERY".to_string(),
+                    runtime_ms: 27,
+                    cancel_requested: false,
+                    sql_preview: "SELECT * FROM users".to_string(),
+                }],
+            }));
+        let (mut client, mut server) = tokio::io::duplex(2048);
+        write_response(&mut client, &response).await.expect("write response");
+        let decoded = read_response(&mut server).await.expect("read response").expect("response");
+        assert_eq!(decoded, response);
+    }
+
+    #[tokio::test]
+    async fn authentication_payload_round_trip() {
+        let response = ResponseFrame::Ok(ResponsePayload::Authentication(AuthenticationPayload {
+            identity: "alice".to_string(),
+            role: "writer".to_string(),
+            auth_scheme: "password".to_string(),
+        }));
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        write_response(&mut client, &response).await.expect("write response");
+        let decoded = read_response(&mut server).await.expect("read response").expect("response");
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn decodes_password_authentication_request() {
+        let request = decode_authentication_request("password\0alice\0secret")
+            .expect("decode password auth request");
+        assert_eq!(
+            request,
+            AuthenticationRequest::Password {
+                username: "alice".to_string(),
+                password: "secret".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_token_authentication_request() {
+        let request =
+            decode_authentication_request("token\0\0opaque-token").expect("decode token request");
+        assert_eq!(request, AuthenticationRequest::Token { token: "opaque-token".to_string() });
+    }
+
+    #[tokio::test]
+    async fn request_frame_limit_rejects_oversized_body() {
+        let request = RequestFrame { request_type: RequestType::Query, sql: "SELECT 1".repeat(64) };
+
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        write_request(&mut client, &request).await.expect("write request");
+        let err = read_request_with_limit(&mut server, 16).await.expect_err("frame too large");
+        assert!(matches!(err, ProtocolError::FrameTooLarge { .. }));
     }
 }
