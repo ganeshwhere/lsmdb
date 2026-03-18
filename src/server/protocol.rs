@@ -20,6 +20,7 @@ pub enum RequestType {
     AdminStatus = 8,
     ActiveStatements = 9,
     CancelStatement = 10,
+    Authenticate = 11,
 }
 
 impl TryFrom<u8> for RequestType {
@@ -37,6 +38,7 @@ impl TryFrom<u8> for RequestType {
             8 => Ok(RequestType::AdminStatus),
             9 => Ok(RequestType::ActiveStatements),
             10 => Ok(RequestType::CancelStatement),
+            11 => Ok(RequestType::Authenticate),
             other => {
                 Err(ProtocolError::InvalidFrame(format!("unknown request type byte: {other}")))
             }
@@ -48,6 +50,12 @@ impl TryFrom<u8> for RequestType {
 pub struct RequestFrame {
     pub request_type: RequestType,
     pub sql: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthenticationRequest {
+    Password { username: String, password: String },
+    Token { token: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -69,6 +77,8 @@ pub enum ErrorCode {
     Timeout = 8,
     Canceled = 9,
     Quota = 10,
+    Unauthenticated = 11,
+    PermissionDenied = 12,
 }
 
 impl TryFrom<u8> for ErrorCode {
@@ -86,6 +96,8 @@ impl TryFrom<u8> for ErrorCode {
             8 => Ok(ErrorCode::Timeout),
             9 => Ok(ErrorCode::Canceled),
             10 => Ok(ErrorCode::Quota),
+            11 => Ok(ErrorCode::Unauthenticated),
+            12 => Ok(ErrorCode::PermissionDenied),
             other => Err(ProtocolError::InvalidFrame(format!("unknown error code byte: {other}"))),
         }
     }
@@ -104,6 +116,8 @@ impl ErrorCode {
             ErrorCode::Timeout => "TIMEOUT",
             ErrorCode::Canceled => "CANCELED",
             ErrorCode::Quota => "QUOTA",
+            ErrorCode::Unauthenticated => "UNAUTHENTICATED",
+            ErrorCode::PermissionDenied => "PERMISSION_DENIED",
         }
     }
 }
@@ -132,6 +146,7 @@ pub enum ResponsePayload {
     AdminStatus(AdminStatusPayload),
     ActiveStatements(ActiveStatementsPayload),
     StatementCancellation(StatementCancellationPayload),
+    Authentication(AuthenticationPayload),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -198,6 +213,13 @@ pub struct StatementCancellationPayload {
     pub status: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticationPayload {
+    pub identity: String,
+    pub role: String,
+    pub auth_scheme: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TransactionState {
@@ -218,7 +240,7 @@ pub enum ProtocolError {
     Utf8(#[from] std::string::FromUtf8Error),
 }
 
-pub async fn read_request<R: AsyncRead + Unpin>(
+pub async fn read_request<R: AsyncRead + Unpin + ?Sized>(
     reader: &mut R,
 ) -> Result<Option<RequestFrame>, ProtocolError> {
     let Some(body) = read_frame(reader, None).await? else {
@@ -227,7 +249,7 @@ pub async fn read_request<R: AsyncRead + Unpin>(
     decode_request(&body).map(Some)
 }
 
-pub async fn read_request_with_limit<R: AsyncRead + Unpin>(
+pub async fn read_request_with_limit<R: AsyncRead + Unpin + ?Sized>(
     reader: &mut R,
     max_body_bytes: usize,
 ) -> Result<Option<RequestFrame>, ProtocolError> {
@@ -237,7 +259,7 @@ pub async fn read_request_with_limit<R: AsyncRead + Unpin>(
     decode_request(&body).map(Some)
 }
 
-pub async fn write_request<W: AsyncWrite + Unpin>(
+pub async fn write_request<W: AsyncWrite + Unpin + ?Sized>(
     writer: &mut W,
     request: &RequestFrame,
 ) -> Result<(), ProtocolError> {
@@ -245,7 +267,7 @@ pub async fn write_request<W: AsyncWrite + Unpin>(
     write_frame(writer, &body).await
 }
 
-pub async fn read_response<R: AsyncRead + Unpin>(
+pub async fn read_response<R: AsyncRead + Unpin + ?Sized>(
     reader: &mut R,
 ) -> Result<Option<ResponseFrame>, ProtocolError> {
     let Some(body) = read_frame(reader, None).await? else {
@@ -254,12 +276,73 @@ pub async fn read_response<R: AsyncRead + Unpin>(
     decode_response(&body).map(Some)
 }
 
-pub async fn write_response<W: AsyncWrite + Unpin>(
+pub async fn write_response<W: AsyncWrite + Unpin + ?Sized>(
     writer: &mut W,
     response: &ResponseFrame,
 ) -> Result<(), ProtocolError> {
     let body = encode_response(response)?;
     write_frame(writer, &body).await
+}
+
+pub fn authentication_request_with_password(
+    username: impl Into<String>,
+    password: impl Into<String>,
+) -> RequestFrame {
+    RequestFrame {
+        request_type: RequestType::Authenticate,
+        sql: encode_authentication_request(AuthenticationRequest::Password {
+            username: username.into(),
+            password: password.into(),
+        }),
+    }
+}
+
+pub fn authentication_request_with_token(token: impl Into<String>) -> RequestFrame {
+    RequestFrame {
+        request_type: RequestType::Authenticate,
+        sql: encode_authentication_request(AuthenticationRequest::Token { token: token.into() }),
+    }
+}
+
+pub fn decode_authentication_request(payload: &str) -> Result<AuthenticationRequest, String> {
+    let mut parts = payload.splitn(3, '\0');
+    let scheme = parts.next().unwrap_or_default();
+    let identity = parts.next().unwrap_or_default();
+    let secret = parts.next().unwrap_or_default();
+
+    match scheme {
+        "password" => {
+            if identity.is_empty() {
+                return Err("password authentication requires a username".to_string());
+            }
+            if secret.is_empty() {
+                return Err("password authentication requires a password".to_string());
+            }
+            Ok(AuthenticationRequest::Password {
+                username: identity.to_string(),
+                password: secret.to_string(),
+            })
+        }
+        "token" => {
+            if !identity.is_empty() {
+                return Err("token authentication does not accept a username".to_string());
+            }
+            if secret.is_empty() {
+                return Err("token authentication requires a token".to_string());
+            }
+            Ok(AuthenticationRequest::Token { token: secret.to_string() })
+        }
+        _ => Err("authentication payload must use the 'password' or 'token' scheme".to_string()),
+    }
+}
+
+fn encode_authentication_request(request: AuthenticationRequest) -> String {
+    match request {
+        AuthenticationRequest::Password { username, password } => {
+            format!("password\0{username}\0{password}")
+        }
+        AuthenticationRequest::Token { token } => format!("token\0\0{token}"),
+    }
 }
 
 pub fn payload_from_execution_result(result: &ExecutionResult) -> ResponsePayload {
@@ -323,7 +406,7 @@ fn hex_char(value: u8) -> char {
     }
 }
 
-async fn read_frame<R: AsyncRead + Unpin>(
+async fn read_frame<R: AsyncRead + Unpin + ?Sized>(
     reader: &mut R,
     max_body_bytes: Option<usize>,
 ) -> Result<Option<Vec<u8>>, ProtocolError> {
@@ -358,7 +441,7 @@ async fn read_frame<R: AsyncRead + Unpin>(
     Ok(Some(body))
 }
 
-async fn write_frame<W: AsyncWrite + Unpin>(
+async fn write_frame<W: AsyncWrite + Unpin + ?Sized>(
     writer: &mut W,
     body: &[u8],
 ) -> Result<(), ProtocolError> {
@@ -515,6 +598,12 @@ fn encode_payload(payload: &ResponsePayload, out: &mut Vec<u8>) -> Result<(), Pr
             out.push(u8::from(payload.accepted));
             write_len_prefixed_bytes(out, payload.status.as_bytes())?;
         }
+        ResponsePayload::Authentication(payload) => {
+            out.push(10_u8);
+            write_len_prefixed_bytes(out, payload.identity.as_bytes())?;
+            write_len_prefixed_bytes(out, payload.role.as_bytes())?;
+            write_len_prefixed_bytes(out, payload.auth_scheme.as_bytes())?;
+        }
     }
     Ok(())
 }
@@ -646,6 +735,16 @@ fn decode_payload(cursor: &mut Cursor<&[u8]>) -> Result<ResponsePayload, Protoco
                 statement_id,
                 accepted,
                 status,
+            }))
+        }
+        10 => {
+            let identity = read_len_prefixed_string(cursor)?;
+            let role = read_len_prefixed_string(cursor)?;
+            let auth_scheme = read_len_prefixed_string(cursor)?;
+            Ok(ResponsePayload::Authentication(AuthenticationPayload {
+                identity,
+                role,
+                auth_scheme,
             }))
         }
         other => {
@@ -828,6 +927,39 @@ mod tests {
         write_response(&mut client, &response).await.expect("write response");
         let decoded = read_response(&mut server).await.expect("read response").expect("response");
         assert_eq!(decoded, response);
+    }
+
+    #[tokio::test]
+    async fn authentication_payload_round_trip() {
+        let response = ResponseFrame::Ok(ResponsePayload::Authentication(AuthenticationPayload {
+            identity: "alice".to_string(),
+            role: "writer".to_string(),
+            auth_scheme: "password".to_string(),
+        }));
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        write_response(&mut client, &response).await.expect("write response");
+        let decoded = read_response(&mut server).await.expect("read response").expect("response");
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn decodes_password_authentication_request() {
+        let request = decode_authentication_request("password\0alice\0secret")
+            .expect("decode password auth request");
+        assert_eq!(
+            request,
+            AuthenticationRequest::Password {
+                username: "alice".to_string(),
+                password: "secret".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_token_authentication_request() {
+        let request =
+            decode_authentication_request("token\0\0opaque-token").expect("decode token request");
+        assert_eq!(request, AuthenticationRequest::Token { token: "opaque-token".to_string() });
     }
 
     #[tokio::test]

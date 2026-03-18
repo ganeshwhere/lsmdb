@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lsmdb::storage::compaction::{CompactionStrategy, LeveledCompactionConfig};
 use lsmdb::storage::engine::{StorageEngine, StorageEngineOptions};
@@ -16,6 +17,25 @@ fn temp_dir(label: &str) -> PathBuf {
     dir.push(format!("lsmdb-engine-{label}-{}-{nanos}", std::process::id()));
     fs::create_dir_all(&dir).expect("create temp directory");
     dir
+}
+
+fn count_user_key_versions(engine: &StorageEngine, user_key: &[u8]) -> usize {
+    let mut versions = 0_usize;
+    for table in engine.sstable_metadata() {
+        let reader = SSTableReader::open(engine.sstable_dir().join(&table.file_name))
+            .expect("open sstable reader");
+        let rows = reader.scan_range(None, None).expect("scan table rows");
+
+        for (internal_key, _value) in rows {
+            if decode_internal_key(&internal_key)
+                .map(|decoded| decoded.user_key == user_key)
+                .unwrap_or(false)
+            {
+                versions += 1;
+            }
+        }
+    }
+    versions
 }
 
 #[test]
@@ -108,21 +128,14 @@ fn compaction_collapses_old_versions_for_same_user_key() {
 
         assert_eq!(engine.get(b"hot-key").expect("read hot key"), Some(b"hot-09".to_vec()));
 
-        let mut hot_versions = 0_usize;
-        for table in engine.sstable_metadata() {
-            let reader = SSTableReader::open(engine.sstable_dir().join(&table.file_name))
-                .expect("open sstable reader");
-            let rows = reader.scan_range(None, None).expect("scan table rows");
-
-            for (internal_key, _value) in rows {
-                if decode_internal_key(&internal_key)
-                    .map(|decoded| decoded.user_key == b"hot-key")
-                    .unwrap_or(false)
-                {
-                    hot_versions += 1;
-                }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let hot_versions = loop {
+            let hot_versions = count_user_key_versions(&engine, b"hot-key");
+            if hot_versions == 1 || Instant::now() >= deadline {
+                break hot_versions;
             }
-        }
+            thread::sleep(Duration::from_millis(25));
+        };
 
         assert_eq!(
             hot_versions, 1,
